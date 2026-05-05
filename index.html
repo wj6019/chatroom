@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>宇宙公司聊天室</title>
+<style>
+/* ===== 样式部分保持不变，仅增加 unread-badge 微调 ===== */
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+:root { --sidebar-bg: #1a1d24; --header-bg: #1a1d24; --accent: #6c63ff; --text-light: #cdd1db; --border: #e4e6ea; --sidebar-w: 240px; --header-h: 52px; --app-top: 0px; --app-height: 100svh; }
+html, body { height: 100%; width: 100%; overflow: hidden; font-family: -apple-system, system-ui, sans-serif; background: #f0f2f5; overscroll-behavior: none; }
+body { position: fixed; inset: 0; }
+#app { position: fixed; left: 0; top: var(--app-top); display: flex; width: 100vw; height: var(--app-height); background: #f0f2f5; overflow: hidden; }
+#sidebar { width: var(--sidebar-w); background: var(--sidebar-bg); display: flex; flex-direction: column; flex-shrink: 0; transition: 0.3s; z-index: 200; }
+#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; background: #fff; min-height: 0; }
+#chat-header { height: var(--header-h); background: var(--header-bg); color: #fff; display: flex; align-items: center; padding: 0 16px; flex-shrink: 0; z-index: 10; }
+#messages-wrap { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 15px; display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+#input-area { min-height: 60px; background: #fff; border-top: 1px solid var(--border); display: flex; align-items: center; padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); flex-shrink: 0; z-index: 100; }
+.msg-row { display: flex; gap: 8px; margin-bottom: 4px; animation: fadeIn 0.15s ease; }
+@keyframes fadeIn { from { opacity:0; transform:translateY(5px); } to { opacity:1; } }
+.msg-row.me { flex-direction: row-reverse; }
+.avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; flex-shrink: 0; }
+.bubble { max-width: 75%; padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.5; word-break: break-all; }
+.msg-row.me .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 2px; }
+.msg-row:not(.me) .bubble { background: #e9ebef; color: #1c1e21; border-bottom-left-radius: 2px; }
+#msg-input { flex: 1; background: #f0f2f5; border: none; border-radius: 20px; padding: 10px 15px; outline: none; font-size: 15px; max-height: 120px; resize: none; overflow-y: hidden; }
+#file-btn, #send-btn { background: var(--accent); color: #fff; border: none; width: 40px; height: 40px; border-radius: 50%; margin-left: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+#file-btn { font-size: 24px; line-height: 1; }
+#file-btn.uploading { opacity: .65; pointer-events: none; }
+.file-link { color: inherit; font-weight: 600; text-decoration: underline; word-break: break-all; }
+.file-hint { font-size: 12px; opacity: .85; margin-top: 3px; }
+.user-item { padding:12px 20px; color:#cdd1db; cursor:pointer; border-bottom:1px solid #2d323e; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.user-item.active { background: var(--accent); color: #fff; }
+.dot { font-size: 10px; }
+.dot.online { color: #48cfad; }
+.dot.offline { color: #666; }
+.unread-badge { background: #ff4d4f; color: white; font-size: 10px; padding: 2px 6px; border-radius: 10px; font-weight: bold; margin-left: auto; }
+@media (max-width: 680px) { #sidebar { position: fixed; left: 0; top: 0; bottom: 0; transform: translateX(-100%); } #sidebar.open { transform: translateX(0); } #menu-btn { display: block !important; margin-right: 10px; font-size: 20px; background: none; border: none; color: #fff; } }
+#overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: none; z-index: 150; }
+#overlay.show { display: block; }
+#nick-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+.modal-box { background: #fff; padding: 28px; border-radius: 16px; width: 85%; max-width: 320px; }
+.modal-box input { width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 8px; outline: none; }
+.modal-box button { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<div id="nick-modal">
+  <div class="modal-box">
+    <h3>身份认证</h3>
+    <p style="font-size:12px; color:#666; margin: 5px 0 15px 0;">新账号自动注册，老账号请直接登陆</p>
+    <input id="nick-input" type="text" maxlength="15" placeholder="设置昵称">
+    <input id="nick-pass" type="password" placeholder="个人密码">
+    <button id="nick-confirm">进入聊天室</button>
+    <p id="nick-err" style="color:red; font-size:12px; margin-top:10px;"></p>
+  </div>
+</div>
+
+<div id="app">
+  <div id="overlay"></div>
+  <div id="sidebar">
+    <div style="padding:20px; color:#fff; border-bottom:1px solid #2d323e;">
+      <b style="font-size:16px;">💬 通讯录</b><br>
+      <small id="my-nick-badge" style="color:var(--accent);"></small>
+    </div>
+    <div id="public-entry" class="user-item active">
+      <span class="dot online">#</span> 公开频道
+      <span id="public-unread" class="unread-badge" style="display:none;"></span>
+    </div>
+    <div id="user-list"></div>
+  </div>
+
+  <div id="main">
+    <div id="chat-header">
+      <button id="menu-btn" style="display:none;">☰</button>
+      <div id="chat-title" style="font-weight:bold;">公开频道</div>
+    </div>
+    <div id="messages-wrap"></div>
+    <div id="input-area">
+      <input id="file-input" type="file" style="display:none">
+      <button id="file-btn" title="上传文件">＋</button>
+      <textarea id="msg-input" placeholder="输入消息..." rows="1"></textarea>
+      <button id="send-btn">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+let myNick = '';
+let currentChat = 'public';
+let ws = null;
+let allUsers = [];
+const privateHistory = {};
+const publicHistory = [];
+
+// 关键变量
+let lastReadTimes = {}; 
+const unreadCounts = {};
+
+const msgInput = document.getElementById('msg-input');
+const fileInput = document.getElementById('file-input');
+const fileBtn = document.getElementById('file-btn');
+const messagesWrap = document.getElementById('messages-wrap');
+const app = document.getElementById('app');
+
+function autoResize() {
+  msgInput.style.height = 'auto';
+  if (msgInput.scrollHeight > 120) {
+    msgInput.style.height = '120px';
+    msgInput.style.overflowY = 'auto';
+  } else {
+    msgInput.style.height = msgInput.scrollHeight + 'px';
+    msgInput.style.overflowY = 'hidden';
+  }
+  scheduleViewportLayout();
+  const wrap = messagesWrap;
+  if (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 80) {
+    scrollBottom();
+  }
+}
+
+let layoutTimer = null;
+function isInputFocused() { return document.activeElement === msgInput; }
+function syncViewportLayout() {
+  const root = document.documentElement;
+  let top = 0;
+  let height = window.innerHeight;
+  if (window.visualViewport) {
+    top = window.visualViewport.offsetTop || 0;
+    height = window.visualViewport.height || window.innerHeight;
+  }
+  root.style.setProperty('--app-top', Math.round(top) + 'px');
+  root.style.setProperty('--app-height', Math.round(height) + 'px');
+  if (window.scrollY !== 0) window.scrollTo(0, 0);
+  if (isInputFocused()) scrollBottom();
+}
+function scheduleViewportLayout() {
+  if (layoutTimer) cancelAnimationFrame(layoutTimer);
+  layoutTimer = requestAnimationFrame(() => {
+    syncViewportLayout();
+    setTimeout(() => { syncViewportLayout(); scrollBottom(); }, 60);
+    setTimeout(() => { syncViewportLayout(); scrollBottom(); }, 260);
+  });
+}
+
+function scrollBottom() { requestAnimationFrame(() => { messagesWrap.scrollTop = messagesWrap.scrollHeight; }); }
+
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('overlay').classList.remove('show');
+}
+
+function connectWs() {
+  const pwd = document.getElementById('nick-pass').value.trim();
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'nick', from: myNick, password: pwd }));
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    
+    if(msg.type === 'read_sync') {
+        lastReadTimes = JSON.parse(msg.content || '{}');
+    } else if(msg.type === 'online') {
+      allUsers = msg.user_list.filter(u => u.name !== myNick);
+      updateUserList();
+    } else if(msg.type === 'public' || msg.type === 'private') {
+      const isPublic = msg.type === 'public';
+      const peer = isPublic ? 'public' : (msg.from === myNick ? msg.to : msg.from);
+      const targetList = isPublic ? publicHistory : (privateHistory[peer] || (privateHistory[peer] = []));
+      
+      targetList.push(msg);
+
+      // 计算未读：如果不是我发的，且当前没在这个窗口，且时间晚于最后阅读时间
+      if (msg.from !== myNick && currentChat !== peer) {
+          const lastTime = lastReadTimes[peer] || 0;
+          if (msg.timestamp > lastTime) {
+              unreadCounts[peer] = (unreadCounts[peer] || 0) + 1;
+              updateUserList();
+          }
+      }
+
+      if(currentChat === peer) appendMsgUI(msg);
+    } else if(msg.type === 'system') {
+      if(msg.content.includes("密码") || msg.content.includes("别处")) {
+        document.getElementById('nick-modal').style.display = 'flex';
+        document.getElementById('nick-err').textContent = msg.content;
+        ws.close();
+      } else {
+        appendSystemMsg(msg.content);
+      }
+    }
+  };
+}
+
+function updateUserList() {
+  // 公开频道未读显示
+  const pubCount = unreadCounts['public'] || 0;
+  const pubBadge = document.getElementById('public-unread');
+  pubBadge.style.display = pubCount > 0 ? 'block' : 'none';
+  pubBadge.textContent = pubCount;
+
+  document.getElementById('user-list').innerHTML = allUsers.map(u => {
+    const count = unreadCounts[u.name] || 0;
+    const badge = count > 0 ? `<span class="unread-badge">${count}</span>` : '';
+    return `
+      <div class="user-item ${currentChat === u.name ? 'active' : ''}" onclick="clickUser('${u.name}')">
+        <span class="dot ${u.online ? 'online' : 'offline'}">${u.online ? '●' : '○'}</span>
+        <span style="flex:1">${u.name}</span>
+        ${badge}
+      </div>
+    `;
+  }).join('');
+}
+
+function clickUser(nick) {
+  currentChat = nick;
+  // 清除本地未读并通知后端已读
+  delete unreadCounts[nick];
+  lastReadTimes[nick] = Math.floor(Date.now() / 1000);
+  if(ws) ws.send(JSON.stringify({ type: 'read_ack', to: nick }));
+  
+  document.getElementById('chat-title').textContent = nick === 'public' ? '公开频道' : '私聊: ' + nick;
+  updateUserList();
+  renderMessages();
+  closeSidebar();
+}
+
+function renderMessages() {
+  messagesWrap.innerHTML = '';
+  const list = currentChat === 'public' ? publicHistory : (privateHistory[currentChat] || []);
+  list.forEach(appendMsgUI);
+  scrollBottom();
+}
+
+function escapeHTML(str) {
+  return String(str || '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+}
+
+function appendMsgUI(msg) {
+  const isMe = msg.from === myNick;
+  const div = document.createElement('div');
+  div.className = `msg-row ${isMe ? 'me' : ''}`;
+  const avatar = escapeHTML((msg.from || '?')[0].toUpperCase());
+  let bodyHTML = escapeHTML(msg.content || '');
+  if (msg.file_url) {
+    const fileName = escapeHTML(msg.file_name || '下载文件');
+    const fileURL = escapeHTML(msg.file_url);
+    bodyHTML = `📎 <a class="file-link" href="${fileURL}" target="_blank" rel="noopener">${fileName}</a><div class="file-hint">点击下载</div>`;
+  }
+  div.innerHTML = `<div class="avatar">${avatar}</div><div class="bubble">${bodyHTML}</div>`;
+  messagesWrap.appendChild(div);
+  scrollBottom();
+}
+
+function appendSystemMsg(text) {
+  const div = document.createElement('div');
+  div.style.cssText = "text-align:center; font-size:12px; color:#999; margin:10px 0;";
+  div.textContent = text;
+  messagesWrap.appendChild(div);
+}
+
+document.getElementById('nick-confirm').onclick = () => {
+  const n = document.getElementById('nick-input').value.trim();
+  const p = document.getElementById('nick-pass').value.trim();
+  if(!n || !p) return;
+  myNick = n;
+  document.getElementById('my-nick-badge').textContent = '@' + myNick;
+  document.getElementById('nick-modal').style.display = 'none';
+  connectWs();
+};
+
+document.getElementById('send-btn').onclick = () => {
+  const content = msgInput.value.trim();
+  if(!content || !ws) return;
+  ws.send(JSON.stringify({ type: currentChat === 'public' ? 'public' : 'private', to: currentChat === 'public' ? '' : currentChat, content: content }));
+  msgInput.value = ''; autoResize(); msgInput.focus();
+};
+
+
+fileBtn.onclick = () => fileInput.click();
+fileInput.onchange = async () => {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+  if (file.size > 100 * 1024 * 1024) {
+    alert('文件不能超过100MB');
+    fileInput.value = '';
+    return;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    alert('连接未就绪，请稍后再试');
+    fileInput.value = '';
+    return;
+  }
+
+  fileBtn.classList.add('uploading');
+  fileBtn.textContent = '…';
+
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch('/upload', { method: 'POST', body: form });
+    if (!res.ok) throw new Error(await res.text() || '上传失败');
+    const data = await res.json();
+
+    ws.send(JSON.stringify({
+      type: currentChat === 'public' ? 'public' : 'private',
+      to: currentChat === 'public' ? '' : currentChat,
+      content: '[文件] ' + data.name,
+      file_name: data.name,
+      file_url: data.url
+    }));
+  } catch (err) {
+    alert((err && err.message) ? err.message : '上传失败');
+  } finally {
+    fileInput.value = '';
+    fileBtn.classList.remove('uploading');
+    fileBtn.textContent = '＋';
+    msgInput.focus();
+    scheduleViewportLayout();
+  }
+};
+
+document.getElementById('public-entry').onclick = () => clickUser('public');
+
+document.getElementById('menu-btn').onclick = () => {
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('overlay').classList.add('show');
+};
+document.getElementById('overlay').onclick = closeSidebar;
+msgInput.onkeydown = (e) => { if(e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('send-btn').click(); } };
+msgInput.addEventListener('input', autoResize);
+
+syncViewportLayout();
+window.addEventListener('resize', scheduleViewportLayout);
+window.addEventListener('orientationchange', () => setTimeout(scheduleViewportLayout, 300));
+msgInput.addEventListener('focus', () => { scheduleViewportLayout(); scrollBottom(); });
+msgInput.addEventListener('blur', () => setTimeout(scheduleViewportLayout, 80));
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', scheduleViewportLayout);
+  window.visualViewport.addEventListener('scroll', scheduleViewportLayout);
+}
+</script>
+</body>
+</html>
