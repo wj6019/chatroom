@@ -5,57 +5,68 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build-linux:
-    runs-on: ubuntu-20.04
+  build-linux-ubuntu20:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates \
+            curl \
+            git \
+            gcc \
+            libc6-dev \
+            pkg-config \
+            wget
 
-    - name: Setup Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.22'
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Generate dependencies
-      run: go mod tidy
+      - name: Install Go 1.22.12
+        run: |
+          wget https://go.dev/dl/go1.22.12.linux-amd64.tar.gz
+          rm -rf /usr/local/go
+          tar -C /usr/local -xzf go1.22.12.linux-amd64.tar.gz
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
 
-    - name: Install CGO dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc libc6-dev
+      - name: Generate dependencies
+        run: |
+          /usr/local/go/bin/go mod tidy
 
-    - name: Build Linux amd64 for Ubuntu 20.04
-      run: |
-        CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o chatroom main.go
+      - name: Build Linux amd64 for Ubuntu 20.04
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 /usr/local/go/bin/go build -o chatroom main.go
 
-    - name: Upload Linux artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: chatroom-linux-ubuntu20
-        path: chatroom
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatroom-linux-ubuntu20
+          path: chatroom
 
   build-windows:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.22'
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
 
-    - name: Generate dependencies
-      run: go mod tidy
+      - name: Generate dependencies
+        run: go mod tidy
 
-    - name: Build Windows amd64
-      run: |
-        go build -o chatroom.exe main.go
+      - name: Build Windows amd64
+        run: go build -o chatroom.exe main.go
 
-    - name: Upload Windows artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: chatroom-windows
-        path: chatroom.exe
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatroom-windows
+          path: chatroom.exe
