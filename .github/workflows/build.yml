@@ -2,68 +2,42 @@ name: Build Chatroom
 
 on:
   push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
+    branches: [ "main" ]
 
 jobs:
-  build-linux:
-    name: Build Linux amd64
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    # 1️⃣ 拉代码
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22.x"
-          cache: true
+    # 2️⃣ 安装 Go
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc libc6-dev
+    # 3️⃣ 生成 go.sum（关键修复）
+    - name: Generate dependencies
+      run: go mod tidy
 
-      - name: Download dependencies
-        run: go mod download
+    # 4️⃣ 构建 Linux
+    - name: Build Linux amd64
+      run: |
+        GOOS=linux GOARCH=amd64 go build -o chatroom main.go
 
-      - name: Build
-        env:
-          CGO_ENABLED: "1"
-          GOOS: linux
-          GOARCH: amd64
-        run: go build -trimpath -ldflags="-s -w" -o chatroom main.go
+    # 5️⃣ 构建 Windows
+    - name: Build Windows amd64
+      run: |
+        GOOS=windows GOARCH=amd64 go build -o chatroom.exe main.go
 
-      - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: chatroom-linux-amd64
-          path: chatroom
-
-  build-windows:
-    name: Build Windows amd64
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22.x"
-          cache: true
-
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Build
-        shell: pwsh
-        env:
-          CGO_ENABLED: "1"
-          GOOS: windows
-          GOARCH: amd64
-        run: go build -trimpath -ldflags="-s -w" -o chatroom.exe main.go
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: chatroom-windows-amd64
-          path: chatroom.exe
+    # 6️⃣ 上传构建产物
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: chatroom-binaries
+        path: |
+          chatroom
+          chatroom.exe
