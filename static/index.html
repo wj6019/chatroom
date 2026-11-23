@@ -1,1443 +1,2621 @@
-package main
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>宇宙公司聊天室</title>
+<style>
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
 
-import (
-	"context"
-	"crypto/sha256"
-	"database/sql"
-	_ "embed"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"log"
-	"math/rand"
-	"net/http"
-	"os"
-	"path/filepath"
-	"regexp"
-	"sort"
-	"strings"
-	"sync"
-	"time"
-
-	"github.com/coder/websocket"
-	_ "github.com/glebarez/go-sqlite"
-)
-
-//go:embed static/index.html
-var indexHTML []byte
-
-const (
-	sendQueueSize         = 128
-	broadcastQueueSize    = 256
-	saveQueueSize         = 512
-	loginHistoryLimit     = 40
-	loadMoreLimit         = 40
-	writeWait             = 10 * time.Second
-	pingInterval          = 25 * time.Second
-	readAckFlushInterval  = 60 * time.Second
-	maxMentionReadEntries = 2000
-	maxMessageChars       = 1000
-	maxUploadBytes        = 100 << 20
-	uploadDir             = "./uploads"
-)
-
-var nickRegexp = regexp.MustCompile(`^[\p{Han}A-Za-z0-9_-]{2,15}$`)
-
-type Message struct {
-	ID                string           `json:"id,omitempty"`
-	Type              string           `json:"type"`
-	From              string           `json:"from"`
-	To                string           `json:"to"`
-	Content           string           `json:"content"`
-	Timestamp         int64            `json:"timestamp"`
-	Password          string           `json:"password,omitempty"`
-	UserList          []UserStatus     `json:"user_list,omitempty"`
-	Mentions          []string         `json:"mentions,omitempty"`
-	Messages          []Message        `json:"messages,omitempty"`
-	HasMore           bool             `json:"has_more,omitempty"`
-	UnreadMap         map[string]int   `json:"unread_map,omitempty"`
-	LastReadMap       map[string]int64 `json:"last_read_map,omitempty"`
-	PrivateHasMoreMap map[string]bool  `json:"private_has_more_map,omitempty"`
-	PublicHasMore     bool             `json:"public_has_more,omitempty"`
-	Seq               int64            `json:"seq,omitempty"`
-	DBID              int64            `json:"db_id,omitempty"`
-	FileName          string           `json:"file_name,omitempty"`
-	FileURL           string           `json:"file_url,omitempty"`
-	FileSize          int64            `json:"file_size,omitempty"`
-	FileMime          string           `json:"file_mime,omitempty"`
+:root {
+  --sidebar-bg: #1a1d24;
+  --header-bg: #1a1d24;
+  --accent: #6c63ff;
+  --text-light: #cdd1db;
+  --border: #e4e6ea;
+  --sidebar-w: 240px;
+  --header-h: 52px;
+  --app-top: 0px;
+  --app-height: 100svh;
 }
 
-type UserStatus struct {
-	Name   string `json:"name"`
-	Online bool   `json:"online"`
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: -apple-system, system-ui, sans-serif;
+  background: #f0f2f5;
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: auto;
 }
 
-type Client struct {
-	conn             *websocket.Conn
-	nick             string
-	inviteCode       string
-	send             chan Message
-	cancel           context.CancelFunc
-	mu               sync.Mutex
-	lastReadMap      map[string]int64
-	mentionReadMap   map[string]bool
-	dirtyLastRead    bool
-	dirtyMentionRead bool
-	closed           bool
+body {
+  position: fixed;
+  inset: 0;
 }
 
-type Hub struct {
-	clients       map[*Client]bool
-	nickMap       map[string]*Client
-	allUsers      map[string]struct{}
-	broadcast     chan Message
-	register      chan *Client
-	unregister    chan *Client
-	saveChan      chan Message
-	userListDirty chan struct{}
-	mu            sync.RWMutex
+#app {
+  position: fixed;
+  left: 0;
+  top: var(--app-top);
+  width: 100vw;
+  height: var(--app-height);
+  background: #f0f2f5;
+  overflow: hidden;
+  display: flex;
 }
 
-var (
-	hub        *Hub
-	db         *sql.DB
-	serverPort string
-)
-
-func initHub() *Hub {
-	return &Hub{
-		clients:       make(map[*Client]bool),
-		nickMap:       make(map[string]*Client),
-		allUsers:      make(map[string]struct{}),
-		broadcast:     make(chan Message, broadcastQueueSize),
-		register:      make(chan *Client),
-		unregister:    make(chan *Client),
-		saveChan:      make(chan Message, saveQueueSize),
-		userListDirty: make(chan struct{}, 1),
-	}
+#sidebar {
+  width: var(--sidebar-w);
+  background: var(--sidebar-bg);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  transition: 0.3s;
+  z-index: 200;
 }
 
-func hashPwd(pwd string) string {
-	h := sha256.New()
-	h.Write([]byte(pwd))
-	return hex.EncodeToString(h.Sum(nil))
+#main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  background: #fff;
+  min-height: 0;
 }
 
-func generateMessageID() string {
-	return fmt.Sprintf("msg_%d_%04d", time.Now().UnixMilli(), rand.Intn(10000))
+#chat-header {
+  height: var(--header-h);
+  background: var(--header-bg);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  flex-shrink: 0;
+  z-index: 10;
 }
 
-func parseMentions(content string, usernames []string, sender string) []string {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return nil
-	}
-
-	candidates := make([]string, 0, len(usernames))
-	for _, name := range usernames {
-		name = strings.TrimSpace(name)
-		if name == "" || name == sender {
-			continue
-		}
-		candidates = append(candidates, name)
-	}
-
-	sort.Slice(candidates, func(i, j int) bool {
-		return len([]rune(candidates[i])) > len([]rune(candidates[j]))
-	})
-
-	seen := make(map[string]bool)
-	var result []string
-	runes := []rune(content)
-
-	for i := 0; i < len(runes); i++ {
-		if runes[i] != '@' {
-			continue
-		}
-		if i > 0 && !isWhitespaceRune(runes[i-1]) {
-			continue
-		}
-
-		rest := string(runes[i+1:])
-		for _, name := range candidates {
-			if strings.HasPrefix(rest, name) {
-				nextPos := i + 1 + len([]rune(name))
-				var nextRune rune
-				if nextPos < len(runes) {
-					nextRune = runes[nextPos]
-				}
-				if nextPos == len(runes) || isMentionBoundary(nextRune) {
-					if !seen[name] {
-						seen[name] = true
-						result = append(result, name)
-					}
-					break
-				}
-			}
-		}
-	}
-
-	return result
+#chat-header-left {
+  display: flex;
+  align-items: center;
+  min-width: 0;
 }
 
-func isWhitespaceRune(r rune) bool {
-	return r == ' ' || r == '\n' || r == '\t' || r == '\r'
+#chat-title {
+  font-weight: bold;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-func isMentionBoundary(r rune) bool {
-	if r == 0 {
-		return true
-	}
-	switch r {
-	case ' ', '\n', '\t', '\r', ',', '，', '.', '。', '!', '！', '?', '？', ':', '：', ';', '；':
-		return true
-	default:
-		return false
-	}
+#header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-func mentionsToJSON(mentions []string) string {
-	if len(mentions) == 0 {
-		return "[]"
-	}
-	b, _ := json.Marshal(mentions)
-	return string(b)
+#mention-bell {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.15);
+  color: #fff;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
 }
 
-func parseMentionsJSON(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	var mentions []string
-	_ = json.Unmarshal([]byte(raw), &mentions)
-	return mentions
+#mention-bell.show {
+  display: inline-flex;
 }
 
-func parseLastReadJSON(raw string) map[string]int64 {
-	if strings.TrimSpace(raw) == "" {
-		return map[string]int64{}
-	}
-	var m map[string]int64
-	if err := json.Unmarshal([]byte(raw), &m); err != nil || m == nil {
-		return map[string]int64{}
-	}
-	return m
+#mention-bell-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #ff4d4f;
+  color: #fff;
+  font-weight: bold;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
 }
 
-func lastReadToJSON(m map[string]int64) string {
-	if m == nil {
-		m = map[string]int64{}
-	}
-	b, _ := json.Marshal(m)
-	return string(b)
+#conn-status {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.15);
+  color: #fff;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
 }
 
-func parseMentionReadJSON(raw string) map[string]bool {
-	if strings.TrimSpace(raw) == "" {
-		return map[string]bool{}
-	}
-	var m map[string]bool
-	if err := json.Unmarshal([]byte(raw), &m); err != nil || m == nil {
-		return map[string]bool{}
-	}
-	return trimMentionReadMap(m, maxMentionReadEntries)
+#conn-status.show {
+  display: inline-flex;
 }
 
-func mentionReadToJSON(m map[string]bool) string {
-	if m == nil {
-		m = map[string]bool{}
-	}
-	b, _ := json.Marshal(m)
-	return string(b)
+#messages-wrap {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overscroll-behavior: contain;
+  position: relative;
 }
 
-func trimMentionReadMap(m map[string]bool, max int) map[string]bool {
-	if len(m) <= max {
-		return m
-	}
-	n := make(map[string]bool, max)
-	i := 0
-	for k, v := range m {
-		n[k] = v
-		i++
-		if i >= max {
-			break
-		}
-	}
-	return n
+#history-actions {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 4px;
+  flex-shrink: 0;
 }
 
-func validateNick(nick string) bool {
-	return nickRegexp.MatchString(nick)
+#load-more-btn {
+  border: none;
+  background: #eef2ff;
+  color: #4338ca;
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 12px;
+  cursor: pointer;
+  font-weight: 600;
 }
 
-func normalizeContent(content string) (string, bool) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return "", false
-	}
-	if len([]rune(content)) > maxMessageChars {
-		return "", false
-	}
-	return content, true
+#load-more-btn[disabled] {
+  background: #e5e7eb;
+  color: #9ca3af;
+  cursor: not-allowed;
 }
 
-func safeSend(c *Client, msg Message) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return false
-	}
-
-	select {
-	case c.send <- msg:
-		return true
-	default:
-		return false
-	}
+.history-divider {
+  text-align: center;
+  font-size: 12px;
+  color: #98a2b3;
+  margin: 6px 0;
 }
 
-func (h *Hub) markUserListDirty() {
-	select {
-	case h.userListDirty <- struct{}{}:
-	default:
-	}
+.history-divider span {
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 4px 10px;
+  display: inline-block;
 }
 
-func (h *Hub) run() {
-	for {
-		select {
-		case client := <-h.register:
-			h.mu.Lock()
-			h.clients[client] = true
-			h.mu.Unlock()
-
-		case client := <-h.unregister:
-			removedNick := ""
-			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				if client.nick != "" {
-					if existing, ok := h.nickMap[client.nick]; ok && existing == client {
-						delete(h.nickMap, client.nick)
-						removedNick = client.nick
-					}
-				}
-				client.mu.Lock()
-				if !client.closed {
-					client.closed = true
-					close(client.send)
-				}
-				client.mu.Unlock()
-				client.cancel()
-			}
-			h.mu.Unlock()
-
-			if removedNick != "" {
-				go flushClientReadState(client)
-				h.markUserListDirty()
-			}
-
-		case msg := <-h.broadcast:
-			h.mu.RLock()
-			snapshot := make([]*Client, 0, len(h.clients))
-			for client := range h.clients {
-				snapshot = append(snapshot, client)
-			}
-			h.mu.RUnlock()
-
-			for _, client := range snapshot {
-				if !safeSend(client, msg) {
-					go func(cl *Client) {
-						h.unregister <- cl
-					}(client)
-				}
-			}
-		}
-	}
+.history-divider.new-msg-divider span {
+  color: #ff4d4f;
+  background: #fff5f5;
+  border-color: #ffd6d6;
 }
 
-func buildUserListSnapshot() []UserStatus {
-	hub.mu.RLock()
-	names := make([]string, 0, len(hub.allUsers))
-	for name := range hub.allUsers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	nickMap := make(map[string]*Client, len(hub.nickMap))
-	for k, v := range hub.nickMap {
-		nickMap[k] = v
-	}
-	hub.mu.RUnlock()
-
-	list := make([]UserStatus, 0, len(names))
-	for _, name := range names {
-		_, isOnline := nickMap[name]
-		list = append(list, UserStatus{Name: name, Online: isOnline})
-	}
-
-	sort.Slice(list, func(i, j int) bool {
-		if list[i].Online != list[j].Online {
-			return list[i].Online
-		}
-		return list[i].Name < list[j].Name
-	})
-
-	return list
+.float-jump-btn {
+  position: absolute;
+  right: 16px;
+  z-index: 110;
+  display: none;
+  border: none;
+  background: #fff;
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.15);
+  cursor: pointer;
 }
 
-func broadcastUserList() {
-	list := buildUserListSnapshot()
-	hub.broadcast <- Message{
-		Type:      "online",
-		UserList:  list,
-		Timestamp: time.Now().Unix(),
-	}
+.float-jump-btn.show {
+  display: inline-flex;
+  align-items: center;
 }
 
-func saveMessage(msg Message) {
-	switch msg.Type {
-	case "system", "online", "read_sync", "mention_read_sync", "history_done", "history_page", "pong", "ping", "unread_sync":
-		return
-	}
-
-	_, err := db.Exec(
-		"INSERT INTO messages (msg_id, type, sender, receiver, content, timestamp, mentions, file_name, file_url, file_size, file_mime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		msg.ID, msg.Type, msg.From, msg.To, msg.Content, msg.Timestamp, mentionsToJSON(msg.Mentions), msg.FileName, msg.FileURL, msg.FileSize, msg.FileMime,
-	)
-	if err != nil {
-		log.Println("DB Error:", err)
-	}
+#input-area {
+  min-height: 60px;
+  background: #fff;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  padding-bottom: calc(10px + env(safe-area-inset-bottom));
+  flex-shrink: 0;
+  z-index: 100;
+  position: relative;
 }
 
-func startSaveWorker() {
-	go func() {
-		for msg := range hub.saveChan {
-			saveMessage(msg)
-		}
-	}()
+.msg-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 4px;
+  animation: fadeIn 0.15s ease;
+  align-items: flex-start;
 }
 
-func enqueueSave(msg Message) {
-	select {
-	case hub.saveChan <- msg:
-	default:
-		go func(m Message) {
-			hub.saveChan <- m
-		}(msg)
-	}
+@keyframes fadeIn {
+  from { opacity:0; transform:translateY(5px); }
+  to { opacity:1; }
 }
 
-func getAllUsernamesFromMemory() []string {
-	hub.mu.RLock()
-	defer hub.mu.RUnlock()
-
-	names := make([]string, 0, len(hub.allUsers))
-	for name := range hub.allUsers {
-		names = append(names, name)
-	}
-	return names
+.msg-row.me {
+  flex-direction: row-reverse;
 }
 
-func userExists(username string) bool {
-	hub.mu.RLock()
-	defer hub.mu.RUnlock()
-	_, ok := hub.allUsers[username]
-	return ok
+.avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: bold;
+  flex-shrink: 0;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: pointer;
 }
 
-func computeUnreadMap(lastRead map[string]int64, me string) map[string]int {
-	result := make(map[string]int)
-
-	publicLast := lastRead["public"]
-	var publicCount int
-	_ = db.QueryRow("SELECT COUNT(*) FROM messages WHERE type='public' AND timestamp > ?", publicLast).Scan(&publicCount)
-	if publicCount > 0 {
-		result["public"] = publicCount
-	}
-
-	hub.mu.RLock()
-	users := make([]string, 0, len(hub.allUsers))
-	for name := range hub.allUsers {
-		if name != me {
-			users = append(users, name)
-		}
-	}
-	hub.mu.RUnlock()
-
-	for _, peer := range users {
-		last := lastRead[peer]
-		var count int
-		_ = db.QueryRow(
-			"SELECT COUNT(*) FROM messages WHERE type='private' AND sender=? AND receiver=? AND timestamp > ?",
-			peer, me, last,
-		).Scan(&count)
-		if count > 0 {
-			result[peer] = count
-		}
-	}
-
-	return result
+.msg-main {
+  display: flex;
+  flex-direction: column;
+  max-width: 75%;
 }
 
-func loadInitialHistory(nick string) ([]Message, bool, map[string]bool, error) {
-	rows, err := db.Query(`
-		SELECT id, msg_id, type, sender, receiver, content, timestamp, mentions, file_name, file_url, file_size, file_mime
-		FROM messages
-		WHERE type='public' OR (type='private' AND (sender=? OR receiver=?))
-		ORDER BY timestamp DESC, id DESC
-		LIMIT ?
-	`, nick, nick, loginHistoryLimit)
-	if err != nil {
-		return nil, false, nil, err
-	}
-	defer rows.Close()
-
-	msgs := make([]Message, 0, loginHistoryLimit)
-	for rows.Next() {
-		var m Message
-		var mentionsRaw string
-		if err := rows.Scan(&m.DBID, &m.ID, &m.Type, &m.From, &m.To, &m.Content, &m.Timestamp, &mentionsRaw, &m.FileName, &m.FileURL, &m.FileSize, &m.FileMime); err != nil {
-			continue
-		}
-		m.Mentions = parseMentionsJSON(mentionsRaw)
-		m.Seq = m.DBID
-		msgs = append(msgs, m)
-	}
-
-	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
-		msgs[i], msgs[j] = msgs[j], msgs[i]
-	}
-
-	publicHasMore := false
-	privateHasMore := make(map[string]bool)
-
-	if len(msgs) == 0 {
-		return msgs, false, privateHasMore, nil
-	}
-
-	var publicMinID int64
-	privateMinIDMap := make(map[string]int64)
-
-	for _, m := range msgs {
-		if m.Type == "public" {
-			if publicMinID == 0 || m.DBID < publicMinID {
-				publicMinID = m.DBID
-			}
-			continue
-		}
-
-		peer := m.From
-		if peer == nick {
-			peer = m.To
-		}
-		if old, ok := privateMinIDMap[peer]; !ok || m.DBID < old {
-			privateMinIDMap[peer] = m.DBID
-		}
-	}
-
-	if publicMinID > 0 {
-		var count int
-		_ = db.QueryRow("SELECT COUNT(*) FROM messages WHERE type='public' AND id < ?", publicMinID).Scan(&count)
-		publicHasMore = count > 0
-	}
-
-	for peer, minID := range privateMinIDMap {
-		var count int
-		_ = db.QueryRow(`
-			SELECT COUNT(*) FROM messages
-			WHERE type='private'
-			  AND ((sender=? AND receiver=?) OR (sender=? AND receiver=?))
-			  AND id < ?
-		`, nick, peer, peer, nick, minID).Scan(&count)
-		privateHasMore[peer] = count > 0
-	}
-
-	return msgs, publicHasMore, privateHasMore, nil
+.msg-row.me .msg-main {
+  align-items: flex-end;
 }
 
-func flushClientReadState(c *Client) {
-	if c == nil || c.nick == "" {
-		return
-	}
-
-	c.mu.Lock()
-	if !c.dirtyLastRead && !c.dirtyMentionRead {
-		c.mu.Unlock()
-		return
-	}
-
-	lastReadJSON := lastReadToJSON(c.lastReadMap)
-	mentionReadJSON := mentionReadToJSON(trimMentionReadMap(c.mentionReadMap, maxMentionReadEntries))
-	dirtyLast := c.dirtyLastRead
-	dirtyMention := c.dirtyMentionRead
-	c.dirtyLastRead = false
-	c.dirtyMentionRead = false
-	nick := c.nick
-	c.mu.Unlock()
-
-	switch {
-	case dirtyLast && dirtyMention:
-		_, err := db.Exec("UPDATE users SET last_read_at = ?, mention_read_at = ? WHERE username = ?", lastReadJSON, mentionReadJSON, nick)
-		if err != nil {
-			log.Println("flush read state error:", err)
-		}
-	case dirtyLast:
-		_, err := db.Exec("UPDATE users SET last_read_at = ? WHERE username = ?", lastReadJSON, nick)
-		if err != nil {
-			log.Println("flush last_read error:", err)
-		}
-	case dirtyMention:
-		_, err := db.Exec("UPDATE users SET mention_read_at = ? WHERE username = ?", mentionReadJSON, nick)
-		if err != nil {
-			log.Println("flush mention_read error:", err)
-		}
-	}
+.msg-meta {
+  font-size: 12px;
+  color: #667085;
+  margin-bottom: 4px;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
-func startReadStateFlusher() {
-	go func() {
-		ticker := time.NewTicker(readAckFlushInterval)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			hub.mu.RLock()
-			clients := make([]*Client, 0, len(hub.clients))
-			for c := range hub.clients {
-				clients = append(clients, c)
-			}
-			hub.mu.RUnlock()
-
-			for _, c := range clients {
-				flushClientReadState(c)
-			}
-		}
-	}()
+.msg-row.me .msg-meta {
+  justify-content: flex-end;
 }
 
-func startUserListBroadcaster() {
-	go func() {
-		for range hub.userListDirty {
-			broadcastUserList()
-			time.Sleep(50 * time.Millisecond)
-		}
-	}()
+.msg-sender {
+  font-weight: 600;
+  color: #4b5563;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
-func (c *Client) handleNick(msg Message) {
-	nick := strings.TrimSpace(msg.From)
-	pwd := hashPwd(msg.Password)
-
-	if !validateNick(nick) {
-		_ = safeSend(c, Message{Type: "system", Content: "昵称仅支持2-15位中文、字母、数字、下划线或中划线"})
-		return
-	}
-
-	var storedPwd string
-	var lastReadJSON, mentionReadJSON string
-
-	err := db.QueryRow("SELECT password, last_read_at, mention_read_at FROM users WHERE username = ?", nick).
-		Scan(&storedPwd, &lastReadJSON, &mentionReadJSON)
-
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		_, insErr := db.Exec(
-			"INSERT INTO users (username, password, last_read_at, mention_read_at) VALUES (?, ?, '{}', '{}')",
-			nick, pwd,
-		)
-		if insErr != nil {
-			log.Println("insert user error:", insErr)
-			err = db.QueryRow("SELECT password, last_read_at, mention_read_at FROM users WHERE username = ?", nick).
-				Scan(&storedPwd, &lastReadJSON, &mentionReadJSON)
-			if err != nil {
-				_ = safeSend(c, Message{Type: "system", Content: "登录失败，请稍后重试"})
-				return
-			}
-			if storedPwd != pwd {
-				_ = safeSend(c, Message{Type: "system", Content: "密码错误或昵称被占用"})
-				return
-			}
-		} else {
-			storedPwd = pwd
-			lastReadJSON = "{}"
-			mentionReadJSON = "{}"
-		}
-	case err != nil:
-		log.Println("query user error:", err)
-		_ = safeSend(c, Message{Type: "system", Content: "登录失败，请稍后重试"})
-		return
-	case storedPwd != pwd:
-		_ = safeSend(c, Message{Type: "system", Content: "密码错误或昵称被占用"})
-		return
-	}
-
-	if err := bindInviteCodeToNick(c.inviteCode, nick); err != nil {
-		_ = safeSend(c, Message{Type: "system", Content: err.Error()})
-		return
-	}
-
-	hub.mu.Lock()
-	if existing, online := hub.nickMap[nick]; online && existing != c {
-		hub.mu.Unlock()
-		_ = safeSend(c, Message{Type: "system", Content: "此账号已在别处登录"})
-		return
-	}
-	c.nick = nick
-	hub.nickMap[nick] = c
-	hub.allUsers[nick] = struct{}{}
-	hub.mu.Unlock()
-
-	c.mu.Lock()
-	c.lastReadMap = parseLastReadJSON(lastReadJSON)
-	c.mentionReadMap = parseMentionReadJSON(mentionReadJSON)
-	c.mu.Unlock()
-
-	_ = safeSend(c, Message{
-		Type:        "read_sync",
-		Content:     lastReadToJSON(c.lastReadMap),
-		LastReadMap: c.lastReadMap,
-	})
-	_ = safeSend(c, Message{
-		Type:    "mention_read_sync",
-		Content: mentionReadToJSON(c.mentionReadMap),
-	})
-
-	unreadMap := computeUnreadMap(c.lastReadMap, c.nick)
-	_ = safeSend(c, Message{
-		Type:      "unread_sync",
-		UnreadMap: unreadMap,
-	})
-
-	go c.loadHistoryAndSync()
-	hub.markUserListDirty()
+.msg-time {
+  color: #98a2b3;
+  font-size: 11px;
 }
 
-func (c *Client) loadHistoryAndSync() {
-	if c.nick == "" {
-		return
-	}
-
-	msgs, publicHasMore, privateHasMore, err := loadInitialHistory(c.nick)
-	if err != nil {
-		log.Println("load history error:", err)
-		_ = safeSend(c, Message{Type: "history_done"})
-		return
-	}
-
-	_ = safeSend(c, Message{
-		Type:              "history_done",
-		Messages:          msgs,
-		PublicHasMore:     publicHasMore,
-		PrivateHasMoreMap: privateHasMore,
-	})
+.bubble {
+  max-width: 100%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 14px;
+  line-height: 1.5;
+  word-break: break-word;
+  white-space: pre-wrap;
 }
 
-func (c *Client) handleReadAck(msg Message) {
-	if c.nick == "" {
-		return
-	}
-	target := strings.TrimSpace(msg.To)
-	if target == "" {
-		target = "public"
-	}
-	c.mu.Lock()
-	if c.lastReadMap == nil {
-		c.lastReadMap = make(map[string]int64)
-	}
-	c.lastReadMap[target] = time.Now().Unix()
-	c.dirtyLastRead = true
-	c.mu.Unlock()
+.msg-row.me .bubble {
+  background: var(--accent);
+  color: #fff;
+  border-bottom-right-radius: 2px;
 }
 
-func (c *Client) handleMentionReadAck(msg Message) {
-	if c.nick == "" {
-		return
-	}
-	mentionMsgID := strings.TrimSpace(msg.Content)
-	if mentionMsgID == "" {
-		return
-	}
-	c.mu.Lock()
-	if c.mentionReadMap == nil {
-		c.mentionReadMap = make(map[string]bool)
-	}
-	c.mentionReadMap[mentionMsgID] = true
-	c.mentionReadMap = trimMentionReadMap(c.mentionReadMap, maxMentionReadEntries)
-	c.dirtyMentionRead = true
-	c.mu.Unlock()
+.msg-row:not(.me) .bubble {
+  background: #e9ebef;
+  color: #1c1e21;
+  border-bottom-left-radius: 2px;
 }
 
-func (c *Client) handlePublic(msg Message) {
-	if c.nick == "" {
-		return
-	}
-
-	content, ok := normalizeContent(msg.Content)
-	if !ok {
-		_ = safeSend(c, Message{Type: "system", Content: fmt.Sprintf("消息不能为空且不能超过%d个字符", maxMessageChars)})
-		return
-	}
-
-	msg.ID = generateMessageID()
-	msg.From = c.nick
-	msg.Timestamp = time.Now().Unix()
-	msg.Content = content
-
-	usernames := getAllUsernamesFromMemory()
-	msg.Mentions = parseMentions(msg.Content, usernames, c.nick)
-
-	hub.broadcast <- msg
-	enqueueSave(msg)
+.msg-row.message-highlight .bubble {
+  animation: mentionPulse 2.5s ease;
+  box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.45);
+  background: #fff3cd !important;
+  color: #1c1e21 !important;
 }
 
-func (c *Client) handlePrivate(msg Message) {
-	if c.nick == "" {
-		return
-	}
-
-	targetUser := strings.TrimSpace(msg.To)
-	if targetUser == "" || targetUser == c.nick {
-		_ = safeSend(c, Message{Type: "system", Content: "私聊目标无效"})
-		return
-	}
-	if !userExists(targetUser) {
-		_ = safeSend(c, Message{Type: "system", Content: "目标用户不存在"})
-		return
-	}
-
-	content, ok := normalizeContent(msg.Content)
-	if !ok {
-		_ = safeSend(c, Message{Type: "system", Content: fmt.Sprintf("消息不能为空且不能超过%d个字符", maxMessageChars)})
-		return
-	}
-
-	msg.ID = generateMessageID()
-	msg.From = c.nick
-	msg.To = targetUser
-	msg.Timestamp = time.Now().Unix()
-	msg.Content = content
-
-	_ = safeSend(c, msg)
-
-	hub.mu.RLock()
-	target, exists := hub.nickMap[msg.To]
-	hub.mu.RUnlock()
-
-	if exists && target != c {
-		_ = safeSend(target, msg)
-	}
-
-	enqueueSave(msg)
+@keyframes mentionPulse {
+  0% { box-shadow: 0 0 0 0 rgba(255,193,7,0.75); }
+  25% { box-shadow: 0 0 0 6px rgba(255,193,7,0.20); }
+  100% { box-shadow: 0 0 0 0 rgba(255,193,7,0); }
 }
 
-func (c *Client) handleLoadMore(msg Message) {
-	if c.nick == "" {
-		return
-	}
-
-	chat := "public"
-	if strings.TrimSpace(msg.To) != "" {
-		chat = strings.TrimSpace(msg.To)
-	}
-
-	beforeTs := msg.Timestamp
-	beforeSeq := msg.Seq
-	if beforeTs <= 0 {
-		beforeTs = time.Now().Unix() + 1
-	}
-	if beforeSeq <= 0 {
-		beforeSeq = 1 << 62
-	}
-
-	var rows *sql.Rows
-	var err error
-
-	if chat == "public" {
-		rows, err = db.Query(`
-			SELECT id, msg_id, type, sender, receiver, content, timestamp, mentions, file_name, file_url, file_size, file_mime
-			FROM messages
-			WHERE type='public'
-			  AND (timestamp < ? OR (timestamp = ? AND id < ?))
-			ORDER BY timestamp DESC, id DESC
-			LIMIT ?
-		`, beforeTs, beforeTs, beforeSeq, loadMoreLimit)
-	} else {
-		if !userExists(chat) {
-			_ = safeSend(c, Message{Type: "system", Content: "目标用户不存在"})
-			return
-		}
-
-		rows, err = db.Query(`
-			SELECT id, msg_id, type, sender, receiver, content, timestamp, mentions, file_name, file_url, file_size, file_mime
-			FROM messages
-			WHERE type='private'
-			  AND ((sender=? AND receiver=?) OR (sender=? AND receiver=?))
-			  AND (timestamp < ? OR (timestamp = ? AND id < ?))
-			ORDER BY timestamp DESC, id DESC
-			LIMIT ?
-		`, c.nick, chat, chat, c.nick, beforeTs, beforeTs, beforeSeq, loadMoreLimit)
-	}
-
-	if err != nil {
-		log.Println("load more error:", err)
-		_ = safeSend(c, Message{Type: "history_page", To: chat, HasMore: false})
-		return
-	}
-	defer rows.Close()
-
-	msgs := make([]Message, 0, loadMoreLimit)
-	for rows.Next() {
-		var m Message
-		var mentionsRaw string
-		if err := rows.Scan(&m.DBID, &m.ID, &m.Type, &m.From, &m.To, &m.Content, &m.Timestamp, &mentionsRaw, &m.FileName, &m.FileURL, &m.FileSize, &m.FileMime); err != nil {
-			continue
-		}
-		m.Mentions = parseMentionsJSON(mentionsRaw)
-		m.Seq = m.DBID
-		msgs = append(msgs, m)
-	}
-
-	hasMore := false
-	if len(msgs) > 0 {
-		last := msgs[len(msgs)-1]
-		if chat == "public" {
-			var count int
-			_ = db.QueryRow(`
-				SELECT COUNT(*) FROM messages
-				WHERE type='public'
-				  AND (timestamp < ? OR (timestamp = ? AND id < ?))
-			`, last.Timestamp, last.Timestamp, last.DBID).Scan(&count)
-			hasMore = count > 0
-		} else {
-			var count int
-			_ = db.QueryRow(`
-				SELECT COUNT(*) FROM messages
-				WHERE type='private'
-				  AND ((sender=? AND receiver=?) OR (sender=? AND receiver=?))
-				  AND (timestamp < ? OR (timestamp = ? AND id < ?))
-			`, c.nick, chat, chat, c.nick, last.Timestamp, last.Timestamp, last.DBID).Scan(&count)
-			hasMore = count > 0
-		}
-	}
-
-	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
-		msgs[i], msgs[j] = msgs[j], msgs[i]
-	}
-
-	_ = safeSend(c, Message{
-		Type:     "history_page",
-		To:       chat,
-		Messages: msgs,
-		HasMore:  hasMore,
-	})
+.mention-text {
+  color: #5b4bff;
+  font-weight: 700;
 }
 
-func (c *Client) readPump(ctx context.Context) {
-	defer func() {
-		hub.unregister <- c
-		_ = c.conn.Close(websocket.StatusNormalClosure, "")
-	}()
-
-	for {
-		_, data, err := c.conn.Read(ctx)
-		if err != nil {
-			return
-		}
-
-		var msg Message
-		if err := json.Unmarshal(data, &msg); err != nil {
-			continue
-		}
-
-		switch msg.Type {
-		case "ping":
-			_ = safeSend(c, Message{Type: "pong", Timestamp: time.Now().Unix()})
-		case "nick":
-			c.handleNick(msg)
-		case "read_ack":
-			c.handleReadAck(msg)
-		case "mention_read_ack":
-			c.handleMentionReadAck(msg)
-		case "public":
-			c.handlePublic(msg)
-		case "private":
-			c.handlePrivate(msg)
-		case "load_more":
-			c.handleLoadMore(msg)
-		}
-	}
+#msg-input {
+  flex: 1;
+  background: #f0f2f5;
+  border: none;
+  border-radius: 20px;
+  padding: 10px 15px;
+  outline: none;
+  font-size: 15px;
+  max-height: 120px;
+  resize: none;
+  overflow-y: hidden;
 }
 
-func (c *Client) writePump(ctx context.Context) {
-	ticker := time.NewTicker(pingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case msg, ok := <-c.send:
-			if !ok {
-				return
-			}
-
-			data, err := json.Marshal(msg)
-			if err != nil {
-				continue
-			}
-
-			writeCtx, cancel := context.WithTimeout(ctx, writeWait)
-			err = c.conn.Write(writeCtx, websocket.MessageText, data)
-			cancel()
-			if err != nil {
-				return
-			}
-
-		case <-ticker.C:
-			writeCtx, cancel := context.WithTimeout(ctx, writeWait)
-			err := c.conn.Ping(writeCtx)
-			cancel()
-			if err != nil {
-				return
-			}
-
-		case <-ctx.Done():
-			return
-		}
-	}
+#send-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  margin-left: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
-func loadAllUsersToMemory() error {
-	rows, err := db.Query("SELECT username FROM users")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	users := make(map[string]struct{})
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err == nil && strings.TrimSpace(name) != "" {
-			users[name] = struct{}{}
-		}
-	}
-
-	hub.mu.Lock()
-	hub.allUsers = users
-	hub.mu.Unlock()
-	return nil
+#upload-btn {
+  background: #f0f2f5;
+  color: #4b5563;
+  border: none;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  margin-right: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 24px;
+  line-height: 1;
+  font-weight: 500;
 }
 
-// 以 invite_codes.txt 为准同步：文件里有的=启用，文件里没有的=停用
-func importInviteCodesFromFile(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Println("read invite codes warn:", err)
-		}
-		return
-	}
-
-	seen := map[string]bool{}
-	var codes []string
-	for _, line := range strings.Split(string(data), "\n") {
-		code := strings.TrimSpace(line)
-		if code == "" || strings.HasPrefix(code, "#") || seen[code] {
-			continue
-		}
-		seen[code] = true
-		codes = append(codes, code)
-	}
-
-	// 防误操作：文件为空时不做任何停用，避免把所有人锁在外面
-	if len(codes) == 0 {
-		log.Println("invite_codes.txt is empty, skip sync")
-		return
-	}
-
-	now := time.Now().Unix()
-	for _, code := range codes {
-		if _, err := db.Exec(
-			"INSERT INTO invite_codes(code, created_at) VALUES(?, ?) ON CONFLICT(code) DO UPDATE SET disabled = 0",
-			code, now,
-		); err != nil {
-			log.Println("import invite code error:", err)
-		}
-	}
-
-	// 找出文件里已不存在、但仍启用的邀请码（先读完再更新，因为连接池只有 1 个连接）
-	rows, err := db.Query("SELECT code FROM invite_codes WHERE disabled = 0")
-	if err != nil {
-		log.Println("query invite codes error:", err)
-		return
-	}
-	var toDisable []string
-	for rows.Next() {
-		var c string
-		if rows.Scan(&c) == nil && !seen[c] {
-			toDisable = append(toDisable, c)
-		}
-	}
-	rows.Close()
-
-	for _, c := range toDisable {
-		if _, err := db.Exec("UPDATE invite_codes SET disabled = 1 WHERE code = ?", c); err != nil {
-			log.Println("disable invite code error:", err)
-		}
-	}
-	log.Printf("Invite codes synced: %d active, %d newly disabled", len(codes), len(toDisable))
+#upload-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
-// 每 10 秒检查文件修改时间，变了就重新同步（热加载）
-func watchInviteCodesFile(path string) {
-	var lastMod time.Time
-	if fi, err := os.Stat(path); err == nil {
-		lastMod = fi.ModTime()
-	}
-	for range time.Tick(10 * time.Second) {
-		fi, err := os.Stat(path)
-		if err != nil || fi.ModTime().Equal(lastMod) {
-			continue
-		}
-		lastMod = fi.ModTime()
-		importInviteCodesFromFile(path)
-	}
+#upload-btn.uploading {
+  animation: uploadSpin 1s linear infinite;
 }
 
-func isInviteCodeValid(code string) bool {
-	code = strings.TrimSpace(code)
-	if code == "" {
-		return false
-	}
-
-	var disabled int
-	err := db.QueryRow("SELECT disabled FROM invite_codes WHERE code = ?", code).Scan(&disabled)
-	if err != nil {
-		return false
-	}
-	return disabled == 0
+@keyframes uploadSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
-func getInviteCodeFromRequest(r *http.Request) (string, bool) {
-	cookie, err := r.Cookie("invite_code")
-	if err != nil || cookie == nil {
-		return "", false
-	}
-
-	code := strings.TrimSpace(cookie.Value)
-	if !isInviteCodeValid(code) {
-		return "", false
-	}
-	return code, true
+#upload-progress {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(100% + 8px);
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.12);
+  padding: 10px 12px;
+  display: none;
+  z-index: 130;
 }
 
-func bindInviteCodeToNick(code, nick string) error {
-	code = strings.TrimSpace(code)
-	nick = strings.TrimSpace(nick)
-	if code == "" || nick == "" {
-		return errors.New("邀请码无效")
-	}
-
-	var usedBy string
-	var disabled int
-	err := db.QueryRow("SELECT used_by, disabled FROM invite_codes WHERE code = ?", code).Scan(&usedBy, &disabled)
-	if err != nil {
-		return errors.New("邀请码无效")
-	}
-	if disabled != 0 {
-		return errors.New("邀请码已被禁用")
-	}
-	if usedBy != "" && usedBy != nick {
-		return errors.New("当前邀请码已绑定其他昵称")
-	}
-	var existingCode string
-	err = db.QueryRow("SELECT code FROM invite_codes WHERE used_by = ? AND code <> ? AND disabled = 0 LIMIT 1", nick, code).Scan(&existingCode)
-	if err == nil {
-		return errors.New("该昵称已绑定其他邀请码")
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if usedBy == nick {
-		return nil
-	}
-
-	res, err := db.Exec(
-		"UPDATE invite_codes SET used_by = ?, used_at = ? WHERE code = ? AND (used_by = '' OR used_by IS NULL)",
-		nick, time.Now().Unix(), code,
-	)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return errors.New("当前邀请码已绑定其他昵称")
-	}
-	return nil
+#upload-progress.show {
+  display: block;
 }
 
-func setupDatabase() error {
-	var err error
-
-	dbPath := strings.TrimSpace(os.Getenv("DATABASE_PATH"))
-	if dbPath == "" {
-		dbPath = "./chat.db"
-	}
-
-	log.Printf("Using database: %s", dbPath)
-
-	db, err = sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=10000")
-	if err != nil {
-		return err
-	}
-
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
-
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL;",
-		"PRAGMA synchronous=NORMAL;",
-		"PRAGMA temp_store=MEMORY;",
-		"PRAGMA foreign_keys=ON;",
-		"PRAGMA busy_timeout=10000;",
-	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			log.Println("pragma warn:", err)
-		}
-	}
-
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS users (
-			username TEXT PRIMARY KEY,
-			password TEXT,
-			last_read_at TEXT DEFAULT '{}',
-			mention_read_at TEXT DEFAULT '{}'
-		)`,
-		`CREATE TABLE IF NOT EXISTS messages (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			msg_id TEXT,
-			type TEXT,
-			sender TEXT,
-			receiver TEXT,
-			content TEXT,
-			timestamp INTEGER,
-			mentions TEXT DEFAULT '[]',
-			file_name TEXT DEFAULT '',
-			file_url TEXT DEFAULT '',
-			file_size INTEGER DEFAULT 0,
-			file_mime TEXT DEFAULT ''
-		)`,
-		`CREATE TABLE IF NOT EXISTS invite_codes (
-			code TEXT PRIMARY KEY,
-			used_by TEXT DEFAULT '',
-			used_at INTEGER DEFAULT 0,
-			created_at INTEGER NOT NULL,
-			disabled INTEGER DEFAULT 0
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp DESC, id DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_messages_private ON messages(type, sender, receiver, timestamp DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages(msg_id)`,
-	}
-
-	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
-			return err
-		}
-	}
-
-	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN last_read_at TEXT DEFAULT '{}'`)
-	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN mention_read_at TEXT DEFAULT '{}'`)
-	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN msg_id TEXT`)
-	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN mentions TEXT DEFAULT '[]'`)
-	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN file_name TEXT DEFAULT ''`)
-	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN file_url TEXT DEFAULT ''`)
-	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN file_size INTEGER DEFAULT 0`)
-	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN file_mime TEXT DEFAULT ''`)
-
-	return nil
+.upload-progress-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: #4b5563;
+  margin-bottom: 8px;
 }
 
-func sanitizeUploadName(name string) string {
-	name = filepath.Base(strings.TrimSpace(name))
-	if name == "" || name == "." || name == string(filepath.Separator) {
-		name = "file"
-	}
-	name = strings.ReplaceAll(name, "\x00", "")
-	return name
+.upload-progress-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
-func handleUpload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if _, ok := getInviteCodeFromRequest(r); !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes+1024*1024)
-	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
-		http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "upload error", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	if header.Size > maxUploadBytes {
-		http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-
-	if err := os.MkdirAll(uploadDir, 0755); err != nil {
-		http.Error(w, "mkdir error", http.StatusInternalServerError)
-		return
-	}
-
-	originalName := sanitizeUploadName(header.Filename)
-	ext := filepath.Ext(originalName)
-	storedName := fmt.Sprintf("%d_%04d%s", time.Now().UnixMilli(), rand.Intn(10000), ext)
-	path := filepath.Join(uploadDir, storedName)
-
-	out, err := os.Create(path)
-	if err != nil {
-		http.Error(w, "save error", http.StatusInternalServerError)
-		return
-	}
-	defer out.Close()
-
-	written, err := io.Copy(out, file)
-	if err != nil {
-		http.Error(w, "write error", http.StatusInternalServerError)
-		return
-	}
-
-	mimeType := header.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"url":  "/files/" + storedName,
-		"name": originalName,
-		"size": written,
-		"mime": mimeType,
-	})
+.upload-progress-bar {
+  height: 7px;
+  background: #eef2ff;
+  border-radius: 999px;
+  overflow: hidden;
 }
 
-func isHTTPSRequest(r *http.Request) bool {
-	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+.upload-progress-inner {
+  width: 0%;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.15s ease;
 }
 
-func main() {
-	rand.Seed(time.Now().UnixNano())
-
-	serverPort = strings.TrimSpace(os.Getenv("PORT"))
-	if serverPort == "" {
-		serverPort = "8080"
-	}
-
-	hub = initHub()
-
-	if err := setupDatabase(); err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	importInviteCodesFromFile("./invite_codes.txt")
-	go watchInviteCodesFile("./invite_codes.txt")
-
-	if err := loadAllUsersToMemory(); err != nil {
-		log.Println("load users warn:", err)
-	}
-
-	startSaveWorker()
-	startReadStateFlusher()
-	startUserListBroadcaster()
-	go hub.run()
-
-	if err := os.MkdirAll(uploadDir, 0755); err != nil {
-		log.Fatal(err)
-	}
-
-	http.HandleFunc("/upload", handleUpload)
-	http.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(uploadDir))))
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := getInviteCodeFromRequest(r); !ok {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(indexHTML)
-	})
-
-	http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			inviteCode := strings.TrimSpace(r.FormValue("invite_code"))
-			if isInviteCodeValid(inviteCode) {
-				http.SetCookie(w, &http.Cookie{
-					Name:     "invite_code",
-					Value:    inviteCode,
-					Path:     "/",
-					MaxAge:   86400 * 7,
-					HttpOnly: true,
-					Secure:   isHTTPSRequest(r),
-					SameSite: http.SameSiteLaxMode,
-				})
-				http.Redirect(w, r, "/", http.StatusSeeOther)
-				return
-			}
-			http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
-			return
-		}
-
-		errorText := ""
-		if r.URL.Query().Get("error") == "1" {
-			errorText = `<p style="color:#ff7875;font-size:12px;margin:0 0 10px 0;">邀请码无效或已被禁用</p>`
-		}
-		_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Login</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#1a1d24;color:#fff}form{background:#2a2d36;padding:30px;border-radius:15px;box-shadow:0 10px 30px rgba(0,0,0,0.5)}input{display:block;width:100%;margin:15px 0;padding:12px;border-radius:8px;border:none}button{width:100%;padding:12px;background:#6c63ff;color:#fff;border:none;border-radius:8px;cursor:pointer}</style></head><body><form method="POST"><h2>宇宙公司聊天室</h2>` + errorText + `<input type="text" name="invite_code" placeholder="请输入邀请码" required autofocus><button type="submit">进入聊天室</button></form></body></html>`))
-	})
-
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		inviteCode, ok := getInviteCodeFromRequest(r)
-		if !ok {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			InsecureSkipVerify: true,
-		})
-		if err != nil {
-			return
-		}
-
-		ctx, cancel := context.WithCancel(r.Context())
-		client := &Client{
-			conn:           conn,
-			inviteCode:     inviteCode,
-			send:           make(chan Message, sendQueueSize),
-			cancel:         cancel,
-			lastReadMap:    make(map[string]int64),
-			mentionReadMap: make(map[string]bool),
-		}
-
-		hub.register <- client
-		go client.writePump(ctx)
-		client.readPump(ctx)
-	})
-
-	log.Printf("Running on :%s", serverPort)
-	log.Fatal(http.ListenAndServe(":"+serverPort, nil))
+.file-card {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 220px;
+  max-width: 320px;
+  white-space: normal;
 }
+
+.file-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  background: rgba(108,99,255,0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  flex-shrink: 0;
+}
+
+.file-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.file-name {
+  display: block;
+  color: inherit;
+  font-weight: 700;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-name:hover {
+  text-decoration: underline;
+}
+
+.file-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.78;
+}
+
+.file-download {
+  color: inherit;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.file-download:hover {
+  text-decoration: underline;
+}
+
+.file-image-preview {
+  display: block;
+  margin-bottom: 8px;
+  border-radius: 12px;
+  overflow: hidden;
+  max-width: 260px;
+  background: rgba(0,0,0,0.04);
+}
+
+.file-image-preview img {
+  display: block;
+  width: 100%;
+  max-height: 220px;
+  object-fit: cover;
+}
+
+.msg-row.me .file-icon {
+  background: rgba(255,255,255,0.18);
+}
+
+.msg-row.me .file-name,
+.msg-row.me .file-download {
+  color: #fff;
+}
+
+.user-item {
+  padding:12px 20px;
+  color:#cdd1db;
+  cursor:pointer;
+  border-bottom:1px solid #2d323e;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.user-item.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.dot {
+  font-size: 10px;
+}
+
+.dot.online {
+  color: #48cfad;
+}
+
+.dot.offline {
+  color: #666;
+}
+
+.unread-badge {
+  background: #ff4d4f;
+  color: white;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  font-weight: bold;
+  margin-left: auto;
+}
+
+.public-entry-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.public-mention-badge {
+  background: #ffa940;
+  color: white;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  font-weight: bold;
+  margin-left: 0;
+}
+
+#mention-panel {
+  position: absolute;
+  left: 12px;
+  right: 60px;
+  bottom: calc(100% + 6px);
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.12);
+  display: none;
+  max-height: 300px;
+  overflow-y: auto;
+  z-index: 120;
+}
+
+#mention-panel.show {
+  display: block;
+}
+
+.mention-group-title {
+  padding: 10px 14px 6px 14px;
+  font-size: 12px;
+  color: #98a2b3;
+  background: #fff;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.mention-item {
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  border-bottom: 1px solid #f1f3f5;
+}
+
+.mention-item:last-child {
+  border-bottom: none;
+}
+
+.mention-item.active {
+  background: #f3f0ff;
+}
+
+.mention-item:hover {
+  background: #f8f7ff;
+}
+
+.mention-checkbox {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.mention-item-name {
+  flex: 1;
+  font-size: 14px;
+  color: #111827;
+}
+
+.mention-item-status {
+  font-size: 12px;
+  color: #98a2b3;
+}
+
+.mention-panel-footer {
+  position: sticky;
+  bottom: 0;
+  background: #fff;
+  padding: 10px 12px;
+  border-top: 1px solid #eceef3;
+}
+
+#mention-insert-btn {
+  width: 100%;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#mention-insert-btn:disabled {
+  background: #c7c9d6;
+  cursor: not-allowed;
+}
+
+#mention-toast-list,
+#system-toast-list {
+  position: fixed;
+  top: 62px;
+  right: 12px;
+  z-index: 500;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+#system-toast-list {
+  top: 118px;
+}
+
+.mention-toast,
+.system-toast {
+  min-width: 220px;
+  max-width: 300px;
+  background: #1f2937;
+  color: #fff;
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.25);
+  animation: toastIn 0.2s ease;
+  pointer-events: auto;
+}
+
+.mention-toast {
+  cursor: pointer;
+}
+
+.system-toast.info {
+  background: #111827;
+}
+
+.system-toast.warn {
+  background: #92400e;
+}
+
+.mention-toast-title {
+  font-size: 12px;
+  color: #cbd5e1;
+  margin-bottom: 4px;
+}
+
+.mention-toast-body,
+.system-toast-body {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 680px) {
+  #sidebar {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    transform: translateX(-100%);
+  }
+
+  #sidebar.open {
+    transform: translateX(0);
+  }
+
+  #menu-btn {
+    display: block !important;
+    margin-right: 10px;
+    font-size: 20px;
+    background: none;
+    border: none;
+    color: #fff;
+  }
+
+  #mention-toast-list,
+  #system-toast-list {
+    left: 12px;
+    right: 12px;
+  }
+
+  #mention-toast-list {
+    top: 60px;
+  }
+
+  #system-toast-list {
+    top: 124px;
+  }
+
+  .mention-toast,
+  .system-toast {
+    max-width: none;
+    width: 100%;
+  }
+}
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  display: none;
+  z-index: 150;
+}
+
+#overlay.show {
+  display: block;
+}
+
+#nick-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.85);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-box {
+  background: #fff;
+  padding: 28px;
+  border-radius: 16px;
+  width: 85%;
+  max-width: 320px;
+}
+
+.modal-box input {
+  width: 100%;
+  padding: 12px;
+  margin-bottom: 10px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  outline: none;
+}
+
+.modal-box button {
+  width: 100%;
+  padding: 12px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-weight: bold;
+}
+</style>
+</head>
+<body>
+
+<div id="nick-modal">
+  <div class="modal-box">
+    <h3>身份认证</h3>
+    <p style="font-size:12px; color:#666; margin: 5px 0 15px 0;">新账号自动注册，老账号请直接登陆</p>
+    <input id="nick-input" type="text" maxlength="15" placeholder="设置昵称">
+    <input id="nick-pass" type="password" placeholder="个人密码">
+    <button id="nick-confirm">进入聊天室</button>
+    <p id="nick-err" style="color:red; font-size:12px; margin-top:10px;"></p>
+  </div>
+</div>
+
+<div id="mention-toast-list"></div>
+<div id="system-toast-list"></div>
+
+<div id="app">
+  <div id="overlay"></div>
+
+  <div id="sidebar">
+    <div style="padding:20px; color:#fff; border-bottom:1px solid #2d323e;">
+      <b style="font-size:16px;">💬 通讯录</b><br>
+      <small id="my-nick-badge" style="color:var(--accent);"></small>
+    </div>
+
+    <div id="public-entry" class="user-item active" data-chat="public">
+      <div class="public-entry-wrap">
+        <span class="dot online">#</span>
+        <span>公开频道</span>
+      </div>
+      <span id="public-mention-unread" class="public-mention-badge" style="display:none;">@0</span>
+      <span id="public-unread" class="unread-badge" style="display:none;"></span>
+    </div>
+
+    <div id="user-list"></div>
+  </div>
+
+  <div id="main">
+    <div id="chat-header">
+      <div id="chat-header-left">
+        <button id="menu-btn" style="display:none;">☰</button>
+        <div id="chat-title">公开频道</div>
+      </div>
+      <div id="header-actions">
+        <div id="conn-status">连接中...</div>
+        <button id="mention-bell" type="button">
+          <span>@提醒</span>
+          <span id="mention-bell-count">0</span>
+        </button>
+      </div>
+    </div>
+
+    <div id="messages-wrap"></div>
+    <button id="jump-first-unread-btn" class="float-jump-btn" type="button">↑ 回到第一条未读</button>
+    <button id="new-msg-below-btn" class="float-jump-btn" type="button"></button>
+
+    <div id="input-area">
+      <div id="mention-panel"></div>
+      <div id="upload-progress">
+        <div class="upload-progress-title">
+          <span id="upload-progress-name" class="upload-progress-name">准备上传...</span>
+          <span id="upload-progress-percent">0%</span>
+        </div>
+        <div class="upload-progress-bar"><div id="upload-progress-inner" class="upload-progress-inner"></div></div>
+      </div>
+      <input type="file" id="fileInput" style="display:none">
+      <button id="upload-btn" type="button" title="上传文件" aria-label="上传文件">+</button>
+      <textarea id="msg-input" maxlength="1000" placeholder="输入消息..." rows="1"></textarea>
+      <button id="send-btn">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+const MAX_PUBLIC_HISTORY = 500;
+const MAX_PRIVATE_HISTORY = 500;
+const MAX_DOM_MESSAGES = 400;
+const RECONNECT_BASE_DELAY = 2000;
+const RECONNECT_MAX_DELAY = 30000;
+const HEARTBEAT_INTERVAL = 30000;
+const HEARTBEAT_TIMEOUT = 10000;
+const MAX_PENDING_MESSAGES = 50;
+const MAX_MESSAGE_LENGTH = 1000;
+const MAX_UPLOAD_SIZE = 100 * 1024 * 1024;
+
+let myNick = '';
+let myPassword = '';
+let currentChat = 'public';
+let ws = null;
+let allUsers = [];
+const privateHistory = {};
+const publicHistory = [];
+const publicMsgIndex = new Map();
+
+let lastReadTimes = {};
+let mentionReadMap = {};
+let unreadCounts = {};
+const mentionNotifications = [];
+
+let wsManuallyClosed = false;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let heartbeatTimer = null;
+let heartbeatTimeoutTimer = null;
+let loginConfirmed = false;
+let pendingMessages = [];
+
+const historyState = {
+  public: {
+    loading: false,
+    hasMore: true,
+    oldestTs: 0,
+    oldestID: 0,
+  },
+  private: {}
+};
+
+const unreadBoundaryMap = {};
+const unreadBoundaryShown = {};
+const unreadMoreBefore = {};
+const chatWindowPending = {};
+let activeChatReady = false;
+let pendingVisibleReadSeq = 0;
+let pendingJumpId = '';
+let newBelowCount = 0;
+let firstUnreadJumpAvailable = false;
+
+const msgInput = document.getElementById('msg-input');
+const messagesWrap = document.getElementById('messages-wrap');
+const mentionPanel = document.getElementById('mention-panel');
+const mentionBell = document.getElementById('mention-bell');
+const mentionBellCount = document.getElementById('mention-bell-count');
+const mentionToastList = document.getElementById('mention-toast-list');
+const systemToastList = document.getElementById('system-toast-list');
+const connStatus = document.getElementById('conn-status');
+const userListEl = document.getElementById('user-list');
+const fileInput = document.getElementById('fileInput');
+const uploadBtn = document.getElementById('upload-btn');
+const uploadProgress = document.getElementById('upload-progress');
+const uploadProgressName = document.getElementById('upload-progress-name');
+const uploadProgressPercent = document.getElementById('upload-progress-percent');
+const uploadProgressInner = document.getElementById('upload-progress-inner');
+const jumpFirstUnreadBtn = document.getElementById('jump-first-unread-btn');
+const newMsgBelowBtn = document.getElementById('new-msg-below-btn');
+
+let layoutTimer = null;
+let lastAppTop = null;
+let lastAppHeight = null;
+let scrollTimer = null;
+let mentionActiveIndex = 0;
+let mentionCandidates = [];
+let longPressTimer = null;
+let selectedMentionUsers = new Set();
+
+function isInputFocused() {
+  return document.activeElement === msgInput;
+}
+
+function setConnStatus(text, visible = true) {
+  connStatus.textContent = text;
+  connStatus.classList.toggle('show', visible);
+}
+
+function showSystemToast(text, level = 'info') {
+  const toast = document.createElement('div');
+  toast.className = `system-toast ${level}`;
+  toast.innerHTML = `<div class="system-toast-body">${escapeHtml(text)}</div>`;
+  systemToastList.appendChild(toast);
+  setTimeout(() => toast.remove(), 2500);
+}
+
+function clearHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  if (heartbeatTimeoutTimer) {
+    clearTimeout(heartbeatTimeoutTimer);
+    heartbeatTimeoutTimer = null;
+  }
+}
+
+function startHeartbeat() {
+  clearHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: 'ping' }));
+      if (heartbeatTimeoutTimer) clearTimeout(heartbeatTimeoutTimer);
+      heartbeatTimeoutTimer = setTimeout(() => {
+        try { ws.close(); } catch {}
+      }, HEARTBEAT_TIMEOUT);
+    } catch {}
+  }, HEARTBEAT_INTERVAL);
+}
+
+function scheduleReconnect() {
+  if (wsManuallyClosed) return;
+  if (!myNick || !myPassword) return;
+  if (reconnectTimer) return;
+
+  reconnectAttempts += 1;
+  const delay = Math.min(RECONNECT_BASE_DELAY * (2 ** Math.max(0, reconnectAttempts - 1)), RECONNECT_MAX_DELAY);
+  setConnStatus(`连接已断开，${Math.round(delay / 1000)}秒后重连...`, true);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWs(true);
+  }, delay);
+}
+
+function syncViewportLayout() {
+  const root = document.documentElement;
+  let top = 0;
+  let height = window.innerHeight;
+
+  if (window.visualViewport) {
+    top = window.visualViewport.offsetTop || 0;
+    height = window.visualViewport.height || window.innerHeight;
+  }
+
+  const newTop = Math.round(top);
+  const newHeight = Math.round(height);
+
+  if (newTop !== lastAppTop) {
+    root.style.setProperty('--app-top', newTop + 'px');
+    lastAppTop = newTop;
+  }
+
+  if (newHeight !== lastAppHeight) {
+    root.style.setProperty('--app-height', newHeight + 'px');
+    lastAppHeight = newHeight;
+  }
+
+  if (isInputFocused() && window.scrollY > 0) {
+    window.scrollTo(0, 0);
+  }
+}
+
+function scheduleViewportLayout() {
+  if (layoutTimer) clearTimeout(layoutTimer);
+  layoutTimer = setTimeout(() => {
+    requestAnimationFrame(() => {
+      syncViewportLayout();
+    });
+  }, 50);
+}
+
+function autoResize() {
+  msgInput.style.height = 'auto';
+
+  if (msgInput.scrollHeight > 120) {
+    msgInput.style.height = '120px';
+    msgInput.style.overflowY = 'auto';
+  } else {
+    msgInput.style.height = msgInput.scrollHeight + 'px';
+    msgInput.style.overflowY = 'hidden';
+  }
+
+  scheduleViewportLayout();
+
+  const wrap = messagesWrap;
+  if (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 80) {
+    scrollBottom();
+  }
+}
+
+function scrollBottom() {
+  if (scrollTimer) cancelAnimationFrame(scrollTimer);
+  scrollTimer = requestAnimationFrame(() => {
+    messagesWrap.scrollTop = messagesWrap.scrollHeight;
+  });
+}
+
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('overlay').classList.remove('show');
+}
+
+function escapeHtml(str) {
+  return (str || '').replace(/[&<>"']/g, s => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[s]));
+}
+
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function formatTime(ts) {
+  const d = new Date(ts * 1000);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+function renderContentWithMentions(content, mentions = []) {
+  let html = escapeHtml(content);
+  const unique = [...new Set((mentions || []).filter(Boolean))].sort((a, b) => b.length - a.length);
+  unique.forEach(name => {
+    const re = new RegExp('@' + escapeRegExp(name), 'g');
+    html = html.replace(re, `<span class="mention-text">@${escapeHtml(name)}</span>`);
+  });
+  return html;
+}
+
+function ensurePrivateState(peer) {
+  if (!historyState.private[peer]) {
+    historyState.private[peer] = {
+      loading: false,
+      hasMore: null,
+      oldestTs: 0,
+      oldestID: 0,
+    };
+  }
+  return historyState.private[peer];
+}
+
+function getChatState(chat) {
+  if (chat === 'public') return historyState.public;
+  return ensurePrivateState(chat);
+}
+
+function updateOldestCursor(chat) {
+  const state = getChatState(chat);
+  const list = chat === 'public' ? publicHistory : (privateHistory[chat] || []);
+  if (!list.length) {
+    state.oldestTs = 0;
+    state.oldestID = 0;
+    return;
+  }
+  const oldest = list[0];
+  state.oldestTs = oldest.timestamp || 0;
+  state.oldestID = oldest.seq || oldest.db_id || 0;
+}
+
+function trimHistoryList(list, max, isPublic) {
+  if (!Array.isArray(list)) return;
+  if (list.length <= max) return;
+  const removed = list.splice(0, list.length - max);
+  if (isPublic) {
+    for (const item of removed) {
+      if (item && item.id) publicMsgIndex.delete(item.id);
+    }
+  }
+}
+
+function parseMentionsFromText(content) {
+  if (!content) return [];
+  const found = [];
+  const sortedUsers = [...allUsers.map(u => u.name), myNick].filter(Boolean).sort((a, b) => b.length - a.length);
+
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] !== '@') continue;
+
+    const prev = i === 0 ? '' : content[i - 1];
+    if (prev && !/\s/.test(prev)) continue;
+
+    let matched = '';
+    for (const name of sortedUsers) {
+      if (content.slice(i + 1, i + 1 + name.length) === name) {
+        const after = content[i + 1 + name.length] || '';
+        if (after === '' || /\s|，|。|,|!|！|\?|？|:|：|;|；/.test(after)) {
+          matched = name;
+          break;
+        }
+      }
+    }
+    if (matched && matched !== myNick && !found.includes(matched)) found.push(matched);
+  }
+  return found;
+}
+
+function getAllMentionUsers() {
+  return allUsers
+    .filter(u => u.name !== myNick)
+    .sort((a, b) => {
+      if (a.online !== b.online) return a.online ? -1 : 1;
+      return a.name.localeCompare(b.name, 'zh-CN');
+    });
+}
+
+function getSortedMentionUsers(keyword = '') {
+  const k = keyword.trim().toLowerCase();
+  return getAllMentionUsers().filter(u => !k || u.name.toLowerCase().includes(k));
+}
+
+function getMentionQueryInfo() {
+  if (currentChat !== 'public') return null;
+
+  const value = msgInput.value;
+  const pos = msgInput.selectionStart;
+  const before = value.slice(0, pos);
+  const match = before.match(/(?:^|\s)@([^\s@]*)$/);
+
+  if (!match) return null;
+
+  const atIndex = before.lastIndexOf('@');
+  if (atIndex < 0) return null;
+
+  const prevChar = atIndex > 0 ? before[atIndex - 1] : '';
+  if (prevChar && !/\s/.test(prevChar)) return null;
+
+  return {
+    keyword: match[1] || '',
+    atIndex,
+    caret: pos
+  };
+}
+
+function isMentionAlreadyRead(msg) {
+  if (!msg || !msg.id) return false;
+  return !!mentionReadMap[msg.id];
+}
+
+function shouldAddMentionNotification(msg) {
+  if (!msg || msg.type !== 'public') return false;
+  if (msg.from === myNick) return false;
+  if (!Array.isArray(msg.mentions) || !msg.mentions.includes(myNick)) return false;
+  if (isMentionAlreadyRead(msg)) return false;
+  return true;
+}
+
+function renderMentionPanel() {
+  const info = getMentionQueryInfo();
+  if (!info) {
+    hideMentionPanel();
+    return;
+  }
+
+  const allMentionUsers = getAllMentionUsers();
+  const filteredUsers = getSortedMentionUsers(info.keyword);
+
+  mentionCandidates = [
+    { type: 'all', name: '__ALL__', online: null }
+  ];
+
+  const onlineUsers = filteredUsers.filter(u => u.online);
+  const offlineUsers = filteredUsers.filter(u => !u.online);
+
+  let html = '';
+
+  html += `
+    <div class="mention-item ${mentionActiveIndex === 0 ? 'active' : ''}" data-type="all" data-name="__ALL__">
+      <input class="mention-checkbox" type="checkbox" data-type="all-checkbox" ${isAllUsersSelected() ? 'checked' : ''}>
+      <span class="mention-item-name">所有用户</span>
+      <span class="mention-item-status">${allMentionUsers.length}人</span>
+    </div>
+  `;
+
+  if (onlineUsers.length) {
+    html += `<div class="mention-group-title">在线用户</div>`;
+    onlineUsers.forEach(u => {
+      mentionCandidates.push({ type: 'user', ...u });
+      const idx = mentionCandidates.length - 1;
+      html += `
+        <div class="mention-item ${mentionActiveIndex === idx ? 'active' : ''}" data-type="user" data-name="${escapeHtml(u.name)}">
+          <input class="mention-checkbox" type="checkbox" data-type="user-checkbox" data-name="${escapeHtml(u.name)}" ${selectedMentionUsers.has(u.name) ? 'checked' : ''}>
+          <span class="dot online">●</span>
+          <span class="mention-item-name">${escapeHtml(u.name)}</span>
+          <span class="mention-item-status">在线</span>
+        </div>
+      `;
+    });
+  }
+
+  if (offlineUsers.length) {
+    html += `<div class="mention-group-title">离线用户</div>`;
+    offlineUsers.forEach(u => {
+      mentionCandidates.push({ type: 'user', ...u });
+      const idx = mentionCandidates.length - 1;
+      html += `
+        <div class="mention-item ${mentionActiveIndex === idx ? 'active' : ''}" data-type="user" data-name="${escapeHtml(u.name)}">
+          <input class="mention-checkbox" type="checkbox" data-type="user-checkbox" data-name="${escapeHtml(u.name)}" ${selectedMentionUsers.has(u.name) ? 'checked' : ''}>
+          <span class="dot offline">○</span>
+          <span class="mention-item-name">${escapeHtml(u.name)}</span>
+          <span class="mention-item-status">离线</span>
+        </div>
+      `;
+    });
+  }
+
+  html += `
+    <div class="mention-panel-footer">
+      <button id="mention-insert-btn" ${selectedMentionUsers.size === 0 ? 'disabled' : ''}>
+        插入已选用户(${selectedMentionUsers.size})
+      </button>
+    </div>
+  `;
+
+  mentionPanel.innerHTML = html;
+  mentionPanel.classList.add('show');
+}
+
+function showMentionPanel() {
+  renderMentionPanel();
+}
+
+function hideMentionPanel() {
+  mentionPanel.classList.remove('show');
+  mentionPanel.innerHTML = '';
+  mentionCandidates = [];
+  mentionActiveIndex = 0;
+  selectedMentionUsers.clear();
+}
+
+function insertMention(name, withGreeting = false) {
+  const info = getMentionQueryInfo();
+  const value = msgInput.value;
+  let newValue = value;
+  let caretPos = 0;
+
+  if (info) {
+    const before = value.slice(0, info.atIndex);
+    const after = value.slice(info.caret);
+    const mentionText = withGreeting ? `@${name} 在吗 ` : `@${name} `;
+    newValue = before + mentionText + after;
+    caretPos = (before + mentionText).length;
+  } else {
+    const prefix = value && !/\s$/.test(value) ? value + ' ' : value;
+    const mentionText = withGreeting ? `@${name} 在吗 ` : `@${name} `;
+    newValue = prefix + mentionText;
+    caretPos = newValue.length;
+  }
+
+  msgInput.value = newValue;
+  msgInput.focus();
+  msgInput.setSelectionRange(caretPos, caretPos);
+  autoResize();
+  hideMentionPanel();
+}
+
+function insertMultipleMentions(names) {
+  const validNames = [...new Set(names.filter(Boolean))];
+  if (!validNames.length) return;
+
+  const info = getMentionQueryInfo();
+  const value = msgInput.value;
+  const mentionText = validNames.map(name => `@${name}`).join(' ') + ' ';
+  let newValue = value;
+  let caretPos = 0;
+
+  if (info) {
+    const before = value.slice(0, info.atIndex);
+    const after = value.slice(info.caret);
+    newValue = before + mentionText + after;
+    caretPos = (before + mentionText).length;
+  } else {
+    const prefix = value && !/\s$/.test(value) ? value + ' ' : value;
+    newValue = prefix + mentionText;
+    caretPos = newValue.length;
+  }
+
+  msgInput.value = newValue;
+  msgInput.focus();
+  msgInput.setSelectionRange(caretPos, caretPos);
+  autoResize();
+  hideMentionPanel();
+}
+
+function insertAllUsersMention() {
+  const names = getAllMentionUsers().map(u => u.name);
+  insertMultipleMentions(names);
+}
+
+function isAllUsersSelected() {
+  const allNames = getAllMentionUsers().map(u => u.name);
+  if (!allNames.length) return false;
+  return allNames.every(name => selectedMentionUsers.has(name));
+}
+
+function toggleSelectAllUsers(checked) {
+  const allNames = getAllMentionUsers().map(u => u.name);
+  if (checked) allNames.forEach(name => selectedMentionUsers.add(name));
+  else allNames.forEach(name => selectedMentionUsers.delete(name));
+  renderMentionPanel();
+}
+
+function toggleSelectOneUser(name, checked) {
+  if (!name) return;
+  if (checked) selectedMentionUsers.add(name);
+  else selectedMentionUsers.delete(name);
+  renderMentionPanel();
+}
+
+function insertSelectedMentionUsers() {
+  const names = getAllMentionUsers().map(u => u.name).filter(name => selectedMentionUsers.has(name));
+  insertMultipleMentions(names);
+}
+
+function updateMentionBell() {
+  const count = mentionNotifications.length;
+  mentionBellCount.textContent = count;
+  mentionBell.classList.toggle('show', count > 0);
+
+  const badge = document.getElementById('public-mention-unread');
+  badge.style.display = count > 0 ? 'inline-flex' : 'none';
+  badge.textContent = '@' + count;
+}
+
+function pushMentionNotification(msg) {
+  if (!msg || !msg.id) return;
+  if (mentionNotifications.some(x => x.id === msg.id)) return;
+  mentionNotifications.push(msg);
+  updateMentionBell();
+}
+
+function removeMentionNotificationByID(id) {
+  const idx = mentionNotifications.findIndex(x => x.id === id);
+  if (idx >= 0) {
+    mentionNotifications.splice(idx, 1);
+    updateMentionBell();
+  }
+}
+
+function consumeNextMentionNotification() {
+  if (!mentionNotifications.length) return null;
+  const item = mentionNotifications.shift();
+  updateMentionBell();
+  return item;
+}
+
+function markMentionReadLocal(id) {
+  if (!id) return;
+  mentionReadMap[id] = true;
+  removeMentionNotificationByID(id);
+}
+
+function sendWs(data) {
+  const raw = JSON.stringify(data);
+  if (ws && ws.readyState === WebSocket.OPEN && loginConfirmed) {
+    ws.send(raw);
+    return true;
+  }
+  pendingMessages.push(raw);
+  if (pendingMessages.length > MAX_PENDING_MESSAGES) {
+    pendingMessages = pendingMessages.slice(-MAX_PENDING_MESSAGES);
+  }
+  return false;
+}
+
+function flushPendingMessages() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !loginConfirmed) return;
+  if (!pendingMessages.length) return;
+  const list = pendingMessages.slice();
+  pendingMessages = [];
+  for (const raw of list) {
+    try { ws.send(raw); } catch {}
+  }
+}
+
+function markMentionReadRemote(id) {
+  if (!id) return;
+  sendWs({ type: 'mention_read_ack', content: id });
+}
+
+function showMentionToast(msg) {
+  const toast = document.createElement('div');
+  toast.className = 'mention-toast';
+  toast.innerHTML = `
+    <div class="mention-toast-title">${escapeHtml(msg.from)} @了你</div>
+    <div class="mention-toast-body">${escapeHtml(msg.content)}</div>
+  `;
+  toast.onclick = () => {
+    if (!isMentionAlreadyRead(msg)) {
+      markMentionReadLocal(msg.id);
+      markMentionReadRemote(msg.id);
+    }
+    jumpToMessage(msg.id);
+    toast.remove();
+  };
+  mentionToastList.appendChild(toast);
+  setTimeout(() => toast.remove(), 4000);
+}
+
+function updateUserList() {
+  const pubCount = unreadCounts['public'] || 0;
+  const pubBadge = document.getElementById('public-unread');
+  pubBadge.style.display = pubCount > 0 ? 'block' : 'none';
+  pubBadge.textContent = pubCount > 99 ? '99+' : pubCount;
+
+  userListEl.innerHTML = allUsers.map(u => {
+    const count = unreadCounts[u.name] || 0;
+    const badge = count > 0 ? `<span class="unread-badge">${count > 99 ? '99+' : count}</span>` : '';
+    return `
+      <div class="user-item ${currentChat === u.name ? 'active' : ''}" data-chat="${escapeHtml(u.name)}">
+        <span class="dot ${u.online ? 'online' : 'offline'}">${u.online ? '●' : '○'}</span>
+        <span style="flex:1">${escapeHtml(u.name)}</span>
+        ${badge}
+      </div>
+    `;
+  }).join('');
+
+  updateMentionBell();
+}
+
+function getMsgSeq(m) {
+  return Number((m && (m.seq || m.db_id)) || 0);
+}
+
+function requestChatWindow(chat) {
+  const state = getChatState(chat);
+  activeChatReady = false;
+  pendingVisibleReadSeq = 0;
+  chatWindowPending[chat] = true;
+  state.loading = true;
+  delete unreadBoundaryMap[chat];
+  delete unreadBoundaryShown[chat];
+  delete unreadMoreBefore[chat];
+  resetFloatButtons();
+  sendWs({ type: 'open_chat', to: chat === 'public' ? '' : chat });
+}
+
+function markCurrentChatRead(seq) {
+  if (!seq) return;
+  if (document.visibilityState === 'visible') {
+    sendWs({ type: 'read_ack', to: currentChat === 'public' ? '' : currentChat, seq });
+  } else {
+    pendingVisibleReadSeq = Math.max(pendingVisibleReadSeq, seq);
+  }
+}
+
+function clickUser(nick) {
+  currentChat = nick;
+
+  delete unreadCounts[nick];
+  const nowTs = Math.floor(Date.now() / 1000);
+  lastReadTimes[nick] = nowTs;
+  requestChatWindow(nick);
+
+  if (nick === 'public') {
+    for (const msg of publicHistory) {
+      const mentionedMe = Array.isArray(msg.mentions) && msg.mentions.includes(myNick);
+      if (mentionedMe && !isMentionAlreadyRead(msg)) {
+        markMentionReadLocal(msg.id);
+        markMentionReadRemote(msg.id);
+      }
+    }
+  }
+
+  document.getElementById('chat-title').textContent = nick === 'public' ? '公开频道' : '私聊: ' + nick;
+  updateUserList();
+  renderMessages();
+  closeSidebar();
+  hideMentionPanel();
+}
+
+function createDividerNode() {
+  const div = document.createElement('div');
+  div.className = 'history-divider new-msg-divider';
+  div.dataset.unreadBoundary = '1';
+  div.innerHTML = `<span>—— 以下为新消息 ——</span>`;
+  return div;
+}
+
+function renderHistoryActions() {
+  const state = getChatState(currentChat);
+  const div = document.createElement('div');
+  div.id = 'history-actions';
+
+  const btn = document.createElement('button');
+  btn.id = 'load-more-btn';
+
+  const hasMoreKnownFalse = state.hasMore === false;
+  const loading = !!state.loading;
+
+  const moreUnread = unreadMoreBefore[currentChat] || 0;
+  btn.textContent = loading ? '加载中...' : (hasMoreKnownFalse ? '没有更多消息' : (moreUnread > 0 ? `加载更多消息（还有 ${moreUnread} 条更早未读）` : '加载更多消息'));
+  btn.disabled = loading || hasMoreKnownFalse;
+  btn.onclick = () => loadMoreHistory();
+
+  div.appendChild(btn);
+  return div;
+}
+
+function createLongPressHandlers(target, name) {
+  const start = () => {
+    if (!name || name === myNick) return;
+    longPressTimer = setTimeout(() => insertMentionDirect(name), 450);
+  };
+
+  const clear = () => {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+  };
+
+  target.addEventListener('touchstart', start, { passive: true });
+  target.addEventListener('touchend', clear);
+  target.addEventListener('touchcancel', clear);
+  target.addEventListener('mousedown', start);
+  target.addEventListener('mouseup', clear);
+  target.addEventListener('mouseleave', clear);
+}
+
+function insertMentionDirect(name) {
+  const value = msgInput.value;
+  const prefix = value && !/\s$/.test(value) ? value + ' ' : value;
+  const newValue = prefix + `@${name} `;
+  msgInput.value = newValue;
+  msgInput.focus();
+  msgInput.setSelectionRange(newValue.length, newValue.length);
+  autoResize();
+  hideMentionPanel();
+}
+
+function formatFileSize(bytes) {
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n <= 0) return '未知大小';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = n;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx++;
+  }
+  return `${value >= 10 || idx === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[idx]}`;
+}
+
+function getFileExtension(name = '') {
+  const clean = String(name || '').split('?')[0];
+  const idx = clean.lastIndexOf('.');
+  return idx >= 0 ? clean.slice(idx + 1).toLowerCase() : '';
+}
+
+function getFileIcon(msg) {
+  const ext = getFileExtension(msg.file_name || msg.file_url || '');
+  const mime = String(msg.file_mime || '').toLowerCase();
+  if (mime.startsWith('image/') || ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) return '🖼️';
+  if (mime.startsWith('video/') || ['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext)) return '🎬';
+  if (mime.startsWith('audio/') || ['mp3', 'wav', 'flac', 'm4a', 'ogg'].includes(ext)) return '🎵';
+  if (['pdf'].includes(ext)) return '📕';
+  if (['doc', 'docx'].includes(ext)) return '📘';
+  if (['xls', 'xlsx', 'csv'].includes(ext)) return '📗';
+  if (['ppt', 'pptx'].includes(ext)) return '📙';
+  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return '🗜️';
+  return '📎';
+}
+
+function isImageFile(msg) {
+  const ext = getFileExtension(msg.file_name || msg.file_url || '');
+  const mime = String(msg.file_mime || '').toLowerCase();
+  return mime.startsWith('image/') || ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'].includes(ext);
+}
+
+function buildFileMessageHTML(msg) {
+  const name = escapeHtml(msg.file_name || '文件');
+  const rawUrl = String(msg.file_url || '');
+  const safeUrl = /^\/files\/[0-9]+_[0-9]{4}(\.[A-Za-z0-9]{1,16})?$/.test(rawUrl) ? rawUrl : '#';
+  const url = escapeHtml(safeUrl);
+  const size = formatFileSize(msg.file_size);
+  const icon = getFileIcon(msg);
+  const preview = isImageFile(msg) && safeUrl !== '#'
+    ? `<a class="file-image-preview" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="${name}" loading="lazy"></a>`
+    : '';
+
+  return `
+    ${preview}
+    <div class="file-card">
+      <div class="file-icon">${icon}</div>
+      <div class="file-body">
+        <a class="file-name" href="${url}" target="_blank" rel="noopener" download="${name}">${name}</a>
+        <div class="file-meta">
+          <span>${size}</span>
+          <span>·</span>
+          <a class="file-download" href="${url}" target="_blank" rel="noopener" download="${name}">下载</a>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function setUploadProgress(show, percent = 0, name = '') {
+  uploadProgress.classList.toggle('show', !!show);
+  uploadBtn.disabled = !!show;
+  uploadBtn.classList.toggle('uploading', !!show);
+  const p = Math.max(0, Math.min(100, Math.round(percent || 0)));
+  uploadProgressName.textContent = name || '准备上传...';
+  uploadProgressPercent.textContent = p + '%';
+  uploadProgressInner.style.width = p + '%';
+}
+
+function uploadFileToServer(file) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const form = new FormData();
+    form.append('file', file);
+
+    xhr.open('POST', '/upload');
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        setUploadProgress(true, (e.loaded / e.total) * 100, file.name);
+      } else {
+        setUploadProgress(true, 5, file.name);
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch (e) {
+          reject(e);
+        }
+      } else {
+        reject(new Error(xhr.responseText || '上传失败'));
+      }
+    };
+    xhr.onerror = () => reject(new Error('网络异常'));
+    xhr.send(form);
+  });
+}
+
+async function handleFileSelected() {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+
+  if (!myNick || !myPassword || !loginConfirmed) {
+    showSystemToast('请先进入聊天室再上传文件', 'warn');
+    fileInput.value = '';
+    return;
+  }
+
+  if (file.size > MAX_UPLOAD_SIZE) {
+    showSystemToast('文件不能超过100MB', 'warn');
+    fileInput.value = '';
+    return;
+  }
+
+  try {
+    setUploadProgress(true, 0, file.name);
+    const data = await uploadFileToServer(file);
+    setUploadProgress(true, 100, file.name);
+
+    const payload = {
+      type: currentChat === 'public' ? 'public' : 'private',
+      to: currentChat === 'public' ? '' : currentChat,
+      content: `📎 ${data.name || file.name}`,
+      file_name: data.name || file.name,
+      file_url: data.url,
+      file_size: data.size || file.size,
+      file_mime: data.mime || file.type || 'application/octet-stream'
+    };
+
+    const sent = sendWs(payload);
+    if (sent || (myNick && myPassword)) {
+      showSystemToast('文件上传完成', 'info');
+      scrollBottom();
+    }
+  } catch (e) {
+    showSystemToast('上传失败：' + (e.message || '未知错误'), 'warn');
+  } finally {
+    setTimeout(() => setUploadProgress(false, 0, ''), 450);
+    fileInput.value = '';
+  }
+}
+
+function buildMessageNode(msg) {
+  const isMe = msg.from === myNick;
+  const div = document.createElement('div');
+  div.className = `msg-row ${isMe ? 'me' : ''}`;
+
+  if (msg.id) {
+    div.dataset.id = msg.id;
+    if (msg.type === 'public') {
+      publicMsgIndex.set(msg.id, div);
+    }
+  }
+
+  div.dataset.timestamp = String(msg.timestamp || 0);
+  div.dataset.seq = String(getMsgSeq(msg));
+  div.dataset.from = msg.from || '';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = (msg.from || '?')[0]?.toUpperCase?.() || '?';
+  avatar.dataset.user = msg.from || '';
+
+  const msgMain = document.createElement('div');
+  msgMain.className = 'msg-main';
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+
+  const sender = document.createElement('span');
+  sender.className = 'msg-sender';
+  sender.textContent = msg.from || '';
+  sender.dataset.user = msg.from || '';
+
+  const timeEl = document.createElement('span');
+  timeEl.className = 'msg-time';
+  timeEl.textContent = formatTime(msg.timestamp || Math.floor(Date.now() / 1000));
+
+  meta.appendChild(sender);
+  meta.appendChild(timeEl);
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  if (msg.file_url) {
+    bubble.innerHTML = buildFileMessageHTML(msg);
+  } else {
+    bubble.innerHTML = renderContentWithMentions(msg.content || '', msg.mentions || []);
+  }
+
+  msgMain.appendChild(meta);
+  msgMain.appendChild(bubble);
+  div.appendChild(avatar);
+  div.appendChild(msgMain);
+
+  createLongPressHandlers(avatar, msg.from);
+  createLongPressHandlers(sender, msg.from);
+
+  return div;
+}
+
+function appendMsgUIWithoutScroll(msg) {
+  messagesWrap.appendChild(buildMessageNode(msg));
+}
+
+function trimMessageDom() {
+  const rows = messagesWrap.querySelectorAll('.msg-row');
+  if (rows.length <= MAX_DOM_MESSAGES) return;
+
+  const removeCount = rows.length - MAX_DOM_MESSAGES;
+  for (let i = 0; i < removeCount; i++) {
+    const node = rows[i];
+    if (node.dataset && node.dataset.id) publicMsgIndex.delete(node.dataset.id);
+    node.remove();
+  }
+}
+
+function appendMsgUI(msg) {
+  const nearBottom = messagesWrap.scrollHeight - messagesWrap.scrollTop - messagesWrap.clientHeight < 80;
+  messagesWrap.appendChild(buildMessageNode(msg));
+  if (nearBottom) trimMessageDom();
+  insertBoundaryDividerIfNeeded(currentChat);
+  if (nearBottom) {
+    scrollBottom();
+  } else if (msg.from !== myNick) {
+    newBelowCount += 1;
+    updateFloatButtons();
+  }
+
+  const mentionedMe = Array.isArray(msg.mentions) && msg.mentions.includes(myNick);
+  if (msg.type === 'public' && mentionedMe && msg.from !== myNick && currentChat === 'public') {
+    flashMessageById(msg.id);
+  }
+}
+
+function flashMessageById(id) {
+  if (!id) return;
+  const el = messagesWrap.querySelector(`[data-id="${id}"]`);
+  if (!el) return;
+  el.classList.remove('message-highlight');
+  void el.offsetWidth;
+  el.classList.add('message-highlight');
+  setTimeout(() => el.classList.remove('message-highlight'), 2600);
+}
+
+function jumpToMessage(id) {
+  if (!id) return;
+  if (currentChat !== 'public' || chatWindowPending['public']) {
+    pendingJumpId = id;
+    if (currentChat !== 'public') clickUser('public');
+    return;
+  }
+
+  requestAnimationFrame(() => {
+    const el = messagesWrap.querySelector(`[data-id="${id}"]`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setTimeout(() => flashMessageById(id), 250);
+  });
+}
+
+function appendSystemMsg(text) {
+  const div = document.createElement('div');
+  div.style.cssText = "text-align:center; font-size:12px; color:#999; margin:10px 0;";
+  div.textContent = text;
+  messagesWrap.appendChild(div);
+  trimMessageDom();
+}
+
+function resetRuntimeOnFreshLogin() {
+  allUsers = [];
+  publicHistory.length = 0;
+  Object.keys(privateHistory).forEach(k => delete privateHistory[k]);
+  publicMsgIndex.clear();
+  unreadCounts = {};
+  lastReadTimes = {};
+  mentionNotifications.length = 0;
+  mentionReadMap = {};
+  pendingMessages = [];
+  Object.keys(historyState.private).forEach(k => delete historyState.private[k]);
+  historyState.public = { loading: false, hasMore: true, oldestTs: 0, oldestID: 0 };
+  Object.keys(unreadBoundaryMap).forEach(k => delete unreadBoundaryMap[k]);
+  Object.keys(unreadBoundaryShown).forEach(k => delete unreadBoundaryShown[k]);
+  messagesWrap.innerHTML = '';
+  updateMentionBell();
+}
+
+function sortMessagesAsc(list) {
+  list.sort((a, b) => {
+    if ((a.timestamp || 0) !== (b.timestamp || 0)) return (a.timestamp || 0) - (b.timestamp || 0);
+    return (a.seq || a.db_id || 0) - (b.seq || b.db_id || 0);
+  });
+}
+
+function makeMsgKey(m) {
+  return m.id || `${m.type}_${m.from}_${m.to}_${m.timestamp}_${m.content}`;
+}
+
+function dedupeAndInsertMessages(chat, newMessages, prepend = false) {
+  if (!Array.isArray(newMessages) || !newMessages.length) return;
+
+  const targetList = chat === 'public' ? publicHistory : (privateHistory[chat] || (privateHistory[chat] = []));
+  const seen = new Set(targetList.map(makeMsgKey));
+  const filtered = [];
+
+  for (const m of newMessages) {
+    const key = makeMsgKey(m);
+    if (!seen.has(key)) {
+      seen.add(key);
+      filtered.push(m);
+    }
+  }
+  if (!filtered.length) return;
+
+  if (prepend) {
+    targetList.unshift(...filtered);
+  } else {
+    targetList.push(...filtered);
+  }
+
+  sortMessagesAsc(targetList);
+  if (!prepend) trimHistoryList(targetList, chat === 'public' ? MAX_PUBLIC_HISTORY : MAX_PRIVATE_HISTORY, chat === 'public');
+  updateOldestCursor(chat);
+}
+
+function handleIncomingChatMessage(msg) {
+  const isPublic = msg.type === 'public';
+  const peer = isPublic ? 'public' : (msg.from === myNick ? msg.to : msg.from);
+  if (!isPublic) ensurePrivateState(peer);
+
+  dedupeAndInsertMessages(peer, [msg], false);
+
+  if (msg.from !== myNick && currentChat !== peer) {
+    unreadCounts[peer] = (unreadCounts[peer] || 0) + 1;
+  }
+
+  if (shouldAddMentionNotification(msg)) {
+    pushMentionNotification(msg);
+    if (currentChat === 'public') showMentionToast(msg);
+  }
+
+  if (currentChat === peer && !chatWindowPending[peer]) appendMsgUI(msg);
+  if (currentChat === peer && activeChatReady && msg.from !== myNick) markCurrentChatRead(getMsgSeq(msg));
+  updateUserList();
+}
+
+function getBoundaryInsertInfo(chat) {
+  if (!unreadBoundaryShown[chat]) return null;
+  if (unreadBoundaryMap[chat] === undefined) return null;
+
+  const boundaryId = unreadBoundaryMap[chat];
+  const rows = [...messagesWrap.querySelectorAll('.msg-row')];
+  let targetRow = null;
+
+  for (const row of rows) {
+    const seq = parseInt(row.dataset.seq || '0', 10);
+    if (seq > boundaryId && row.dataset.from !== myNick) {
+      targetRow = row;
+      break;
+    }
+  }
+
+  return { targetRow, boundaryId };
+}
+
+function insertBoundaryDividerIfNeeded(chat) {
+  const old = messagesWrap.querySelector('.history-divider[data-unread-boundary="1"]');
+  if (old) old.remove();
+
+  const info = getBoundaryInsertInfo(chat);
+  if (!info || !info.targetRow) return;
+
+  const divider = createDividerNode();
+  messagesWrap.insertBefore(divider, info.targetRow);
+}
+
+function renderMessages(options = {}) {
+  const shouldScrollBottom = options.scrollBottom !== false;
+
+  messagesWrap.innerHTML = '';
+  publicMsgIndex.clear();
+
+  messagesWrap.appendChild(renderHistoryActions());
+
+  const list = chatWindowPending[currentChat] ? [] : (currentChat === 'public' ? publicHistory : (privateHistory[currentChat] || []));
+  list.forEach(appendMsgUIWithoutScroll);
+
+  if (shouldScrollBottom) trimMessageDom();
+  insertBoundaryDividerIfNeeded(currentChat);
+
+  if (shouldScrollBottom) {
+    scrollBottom();
+  }
+}
+
+function checkUnreadBoundaryCross(chat, loadedMessages) {
+  if (!Array.isArray(loadedMessages)) return;
+  if (unreadBoundaryShown[chat]) return;
+  if (unreadBoundaryMap[chat] === undefined) return;
+
+  const boundaryId = unreadBoundaryMap[chat];
+  const loadedUnread = loadedMessages.filter(m => getMsgSeq(m) > boundaryId && m.from !== myNick).length;
+  unreadMoreBefore[chat] = Math.max(0, (unreadMoreBefore[chat] || 0) - loadedUnread);
+
+  const crossed = loadedMessages.some(m => getMsgSeq(m) <= boundaryId);
+  if (!crossed && getChatState(chat).hasMore !== false) return;
+
+  unreadBoundaryShown[chat] = true;
+  unreadMoreBefore[chat] = 0;
+
+  if (currentChat === chat) {
+    showSystemToast('已加载到已读位置，分隔线以上为更早的已读历史', 'info');
+  }
+}
+
+// 第一条未读：优先取“以下为新消息”分隔线；未读超过 300 条时取本次加载的第一条未读
+function getFirstUnreadRow(chat) {
+  if (unreadBoundaryMap[chat] === undefined) return null;
+  const divider = messagesWrap.querySelector('.history-divider[data-unread-boundary="1"]');
+  if (divider) return divider;
+  const boundaryId = unreadBoundaryMap[chat];
+  const rows = [...messagesWrap.querySelectorAll('.msg-row')];
+  return rows.find(row => parseInt(row.dataset.seq || '0', 10) > boundaryId && row.dataset.from !== myNick) || null;
+}
+
+function handleChatWindow(msg) {
+  const chat = msg.to || 'public';
+  if (chat !== 'public') ensurePrivateState(chat);
+  const state = getChatState(chat);
+  const messages = Array.isArray(msg.messages) ? msg.messages : [];
+
+  // 用服务器返回的窗口替换本地缓存，保留窗口之后才到达的实时消息
+  const windowMaxSeq = messages.length ? getMsgSeq(messages[messages.length - 1]) : 0;
+  const oldList = chat === 'public' ? publicHistory : (privateHistory[chat] || []);
+  const newer = oldList.filter(m => getMsgSeq(m) > windowMaxSeq);
+  if (chat === 'public') {
+    publicHistory.length = 0;
+    publicMsgIndex.clear();
+  } else {
+    privateHistory[chat] = [];
+  }
+  dedupeAndInsertMessages(chat, messages.concat(newer), false);
+  updateOldestCursor(chat);
+
+  state.loading = false;
+  state.hasMore = !!msg.has_more;
+  chatWindowPending[chat] = false;
+
+  const lastReadId = Number(msg.last_read_id || 0);
+  const unreadTotal = Number(msg.unread_total || 0);
+  if (unreadTotal > 0) {
+    unreadBoundaryMap[chat] = lastReadId;
+    const loadedUnread = messages.filter(m => getMsgSeq(m) > lastReadId && m.from !== myNick).length;
+    unreadMoreBefore[chat] = Math.max(0, unreadTotal - loadedUnread);
+    unreadBoundaryShown[chat] = unreadMoreBefore[chat] === 0;
+  } else {
+    delete unreadBoundaryMap[chat];
+    delete unreadBoundaryShown[chat];
+    delete unreadMoreBefore[chat];
+  }
+
+  if (chat !== currentChat) return;
+  activeChatReady = true;
+
+  if (chat === 'public') {
+    for (const m of publicHistory) {
+      const mentionedMe = Array.isArray(m.mentions) && m.mentions.includes(myNick);
+      if (mentionedMe && !isMentionAlreadyRead(m)) {
+        markMentionReadLocal(m.id);
+        markMentionReadRemote(m.id);
+      }
+    }
+  }
+
+  renderMessages({ scrollBottom: false });
+  positionAfterChatWindow(chat, unreadTotal > 0);
+}
+
+function positionAfterChatWindow(chat, hasUnread) {
+  requestAnimationFrame(() => {
+    if (pendingJumpId) {
+      const id = pendingJumpId;
+      pendingJumpId = '';
+      const el = messagesWrap.querySelector(`[data-id="${id}"]`);
+      if (el) {
+        el.scrollIntoView({ block: 'center' });
+        setTimeout(() => flashMessageById(id), 250);
+        updateFloatButtons();
+        return;
+      }
+    }
+
+    if (!hasUnread) {
+      messagesWrap.scrollTop = messagesWrap.scrollHeight;
+      updateFloatButtons();
+      return;
+    }
+
+    let anchor = null;
+    const divider = messagesWrap.querySelector('.history-divider[data-unread-boundary="1"]');
+    if (divider) {
+      // 第一条未读放在屏幕靠上位置，上方露出 1~2 条已读
+      anchor = divider;
+      let el = divider.previousElementSibling;
+      let n = 0;
+      while (el && n < 2) {
+        if (el.classList.contains('msg-row')) {
+          anchor = el;
+          n += 1;
+        }
+        el = el.previousElementSibling;
+      }
+    } else {
+      // 未读超过 300 条：停在本次加载的最早一条，顶部显示“还有更早未读”
+      anchor = document.getElementById('history-actions');
+    }
+
+    messagesWrap.scrollTop = anchor ? Math.max(0, anchor.offsetTop - 12) : messagesWrap.scrollHeight;
+    firstUnreadJumpAvailable = true;
+    updateFloatButtons();
+  });
+}
+
+function positionFloatButtons() {
+  const mainEl = document.getElementById('main');
+  if (!mainEl) return;
+  const mainRect = mainEl.getBoundingClientRect();
+  const wrapRect = messagesWrap.getBoundingClientRect();
+  jumpFirstUnreadBtn.style.top = Math.round(wrapRect.top - mainRect.top + 10) + 'px';
+  newMsgBelowBtn.style.bottom = Math.round(mainRect.bottom - wrapRect.bottom + 12) + 'px';
+}
+
+function updateFloatButtons() {
+  const distance = messagesWrap.scrollHeight - messagesWrap.scrollTop - messagesWrap.clientHeight;
+  if (distance < 80) newBelowCount = 0;
+
+  newMsgBelowBtn.textContent = `↓ ${newBelowCount > 99 ? '99+' : newBelowCount} 条新消息`;
+  newMsgBelowBtn.classList.toggle('show', newBelowCount > 0);
+
+  let showJump = false;
+  if (firstUnreadJumpAvailable) {
+    const target = getFirstUnreadRow(currentChat);
+    showJump = !!target && (target.offsetTop + target.offsetHeight < messagesWrap.scrollTop);
+  }
+  jumpFirstUnreadBtn.classList.toggle('show', showJump);
+
+  if (showJump || newBelowCount > 0) positionFloatButtons();
+}
+
+function resetFloatButtons() {
+  newBelowCount = 0;
+  firstUnreadJumpAvailable = false;
+  newMsgBelowBtn.classList.remove('show');
+  jumpFirstUnreadBtn.classList.remove('show');
+}
+
+function findLatestMessageInBatch(messages) {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  // messages 按时间升序排列，最后一条就是这批新加载内容里“最新”的消息
+  return messages[messages.length - 1] || null;
+}
+
+function scrollMessageNearInputById(id) {
+  if (!id) return;
+
+  requestAnimationFrame(() => {
+    const el = messagesWrap.querySelector(`[data-id="${id}"]`);
+    if (!el) return;
+
+    // 让目标消息靠近输入框上方，而不是居中
+    const targetTop = el.offsetTop - messagesWrap.clientHeight + el.offsetHeight + 24;
+    messagesWrap.scrollTop = Math.max(0, targetTop);
+  });
+}
+
+function loadMoreHistory() {
+  const state = getChatState(currentChat);
+  if (state.loading) return;
+  if (state.hasMore === false) return;
+
+  state.loading = true;
+  renderMessages({ scrollBottom: false });
+
+  const payload = {
+    type: 'load_more',
+    to: currentChat === 'public' ? '' : currentChat,
+    timestamp: state.oldestTs || 0,
+    seq: state.oldestID || 0
+  };
+
+  sendWs(payload);
+}
+
+function connectWs(isReconnect = false) {
+  if (!myNick || !myPassword) return;
+
+  wsManuallyClosed = false;
+  loginConfirmed = false;
+  clearHeartbeat();
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  if (!isReconnect) {
+    reconnectAttempts = 0;
+    resetRuntimeOnFreshLogin();
+  }
+
+  setConnStatus(isReconnect ? '正在重连...' : '正在连接...', true);
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    reconnectAttempts = 0;
+    setConnStatus('已连接，正在同步...', true);
+    ws.send(JSON.stringify({ type: 'nick', from: myNick, password: myPassword }));
+    startHeartbeat();
+  };
+
+  ws.onmessage = (e) => {
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch {
+      return;
+    }
+
+    if (msg.type === 'pong') {
+      if (heartbeatTimeoutTimer) {
+        clearTimeout(heartbeatTimeoutTimer);
+        heartbeatTimeoutTimer = null;
+      }
+      return;
+    }
+
+    if (!loginConfirmed && ['read_sync', 'mention_read_sync', 'unread_sync', 'history_done', 'online', 'public', 'private', 'system'].includes(msg.type)) {
+      loginConfirmed = true;
+      setConnStatus('', false);
+      flushPendingMessages();
+    }
+
+    if (msg.type === 'read_sync') {
+      try {
+        lastReadTimes = msg.last_read_map || JSON.parse(msg.content || '{}') || {};
+      } catch {
+        lastReadTimes = {};
+      }
+    } else if (msg.type === 'mention_read_sync') {
+      try {
+        mentionReadMap = JSON.parse(msg.content || '{}') || {};
+      } catch {
+        mentionReadMap = {};
+      }
+    } else if (msg.type === 'unread_sync') {
+      unreadCounts = msg.unread_map || {};
+      updateUserList();
+      
+    } else if (msg.type === 'history_page') {
+      const chat = msg.to || 'public';
+      const messages = Array.isArray(msg.messages) ? msg.messages : [];
+      const state = getChatState(chat);
+      state.loading = false;
+      state.hasMore = !!msg.has_more;
+
+      let prevHeight = 0;
+      let prevTop = 0;
+      const isCurrentChat = currentChat === chat;
+
+      if (isCurrentChat) {
+        prevHeight = messagesWrap.scrollHeight;
+        prevTop = messagesWrap.scrollTop;
+      }
+
+      if (messages.length) {
+        dedupeAndInsertMessages(chat, messages, true);
+      }
+      checkUnreadBoundaryCross(chat, messages);
+
+      if (isCurrentChat) {
+        renderMessages({ scrollBottom: false });
+
+        // 向上翻页：保持原相对位置，继续自然往上阅读
+        requestAnimationFrame(() => {
+          const newHeight = messagesWrap.scrollHeight;
+          messagesWrap.scrollTop = Math.max(0, newHeight - prevHeight + prevTop);
+          updateFloatButtons();
+        });
+      }
+    } else if (msg.type === 'chat_window') {
+      handleChatWindow(msg);
+    } else if (msg.type === 'history_done') {
+      if (Array.isArray(msg.messages) && msg.messages.length) {
+        for (const m of msg.messages) {
+          const peer = m.type === 'public' ? 'public' : (m.from === myNick ? m.to : m.from);
+          if (peer !== 'public') ensurePrivateState(peer);
+          dedupeAndInsertMessages(peer, [m], false);
+        }
+      }
+
+      historyState.public.hasMore = !!msg.public_has_more;
+      updateOldestCursor('public');
+
+      const privateMore = msg.private_has_more_map || {};
+      Object.keys(privateHistory).forEach(peer => {
+        const st = ensurePrivateState(peer);
+        if (Object.prototype.hasOwnProperty.call(privateMore, peer)) {
+          st.hasMore = !!privateMore[peer];
+        } else if (st.hasMore === null) {
+          st.hasMore = true;
+        }
+        updateOldestCursor(peer);
+      });
+
+      clickUser(currentChat);
+      updateUserList();
+      setConnStatus('', false);
+    } else if (msg.type === 'online') {
+      allUsers = (msg.user_list || []).filter(u => u.name !== myNick);
+      updateUserList();
+      if (currentChat === 'public' && document.activeElement === msgInput) {
+        showMentionPanel();
+      }
+    } else if (msg.type === 'public' || msg.type === 'private') {
+      handleIncomingChatMessage(msg);
+    } else if (msg.type === 'system') {
+      if (msg.content.includes("密码") || msg.content.includes("别处") || msg.content.includes("昵称")) {
+        wsManuallyClosed = true;
+        loginConfirmed = false;
+        document.getElementById('nick-modal').style.display = 'flex';
+        document.getElementById('nick-err').textContent = msg.content;
+        setConnStatus('', false);
+        try { ws.close(); } catch {}
+      } else {
+        appendSystemMsg(msg.content);
+        showSystemToast(msg.content, 'warn');
+      }
+    }
+  };
+
+  ws.onerror = () => setConnStatus('连接异常', true);
+
+  ws.onclose = () => {
+    clearHeartbeat();
+    loginConfirmed = false;
+    activeChatReady = false;
+    if (!wsManuallyClosed) scheduleReconnect();
+  };
+}
+
+document.getElementById('nick-confirm').onclick = () => {
+  const n = document.getElementById('nick-input').value.trim();
+  const p = document.getElementById('nick-pass').value.trim();
+  if (!n || !p) return;
+
+  myNick = n;
+  myPassword = p;
+  currentChat = 'public';
+
+  document.getElementById('my-nick-badge').textContent = '@' + myNick;
+  document.getElementById('nick-err').textContent = '';
+  document.getElementById('nick-modal').style.display = 'none';
+  connectWs(false);
+};
+
+uploadBtn.onclick = () => fileInput.click();
+fileInput.addEventListener('change', handleFileSelected);
+
+document.getElementById('send-btn').onclick = () => {
+  const content = msgInput.value.trim();
+  if (!content) return;
+  if (content.length > MAX_MESSAGE_LENGTH) {
+    showSystemToast(`消息不能超过 ${MAX_MESSAGE_LENGTH} 个字符`, 'warn');
+    return;
+  }
+
+  const payload = {
+    type: currentChat === 'public' ? 'public' : 'private',
+    to: currentChat === 'public' ? '' : currentChat,
+    content
+  };
+
+  if (currentChat === 'public') {
+    payload.mentions = parseMentionsFromText(content);
+  }
+
+  const sent = sendWs(payload);
+  if (sent || (myNick && myPassword)) {
+    msgInput.value = '';
+    autoResize();
+    hideMentionPanel();
+    msgInput.focus();
+  }
+};
+
+document.getElementById('public-entry').onclick = () => clickUser('public');
+
+document.getElementById('menu-btn').onclick = () => {
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('overlay').classList.add('show');
+};
+
+document.getElementById('overlay').onclick = closeSidebar;
+
+mentionBell.onclick = () => {
+  const item = consumeNextMentionNotification();
+  if (!item) return;
+  if (!isMentionAlreadyRead(item)) {
+    markMentionReadLocal(item.id);
+    markMentionReadRemote(item.id);
+  }
+  jumpToMessage(item.id);
+};
+
+mentionPanel.addEventListener('mousedown', (e) => e.preventDefault());
+
+mentionPanel.addEventListener('click', (e) => {
+  const checkbox = e.target.closest('.mention-checkbox');
+  if (checkbox) {
+    e.stopPropagation();
+    if (checkbox.dataset.type === 'all-checkbox') return toggleSelectAllUsers(checkbox.checked);
+    if (checkbox.dataset.type === 'user-checkbox') return toggleSelectOneUser(checkbox.dataset.name, checkbox.checked);
+  }
+
+  const insertBtn = e.target.closest('#mention-insert-btn');
+  if (insertBtn) {
+    if (!selectedMentionUsers.size) return;
+    return insertSelectedMentionUsers();
+  }
+
+  const item = e.target.closest('.mention-item');
+  if (!item) return;
+
+  const type = item.dataset.type;
+  const name = item.dataset.name;
+  if (type === 'all') return insertAllUsersMention();
+  if (type === 'user') return insertMention(name, false);
+});
+
+userListEl.addEventListener('click', (e) => {
+  const item = e.target.closest('.user-item');
+  if (!item) return;
+  const nick = item.dataset.chat;
+  if (!nick) return;
+  clickUser(nick);
+});
+
+messagesWrap.addEventListener('click', (e) => {
+  if (e.target.closest('#load-more-btn')) return;
+  const userEl = e.target.closest('[data-user]');
+  if (!userEl) return;
+  const name = userEl.dataset.user;
+  if (!name || name === myNick) return;
+  clickUser(name);
+});
+
+msgInput.onkeydown = (e) => {
+  if (mentionPanel.classList.contains('show') && mentionCandidates.length) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      mentionActiveIndex = (mentionActiveIndex + 1) % mentionCandidates.length;
+      renderMentionPanel();
+      return;
+    }
+
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      mentionActiveIndex = (mentionActiveIndex - 1 + mentionCandidates.length) % mentionCandidates.length;
+      renderMentionPanel();
+      return;
+    }
+
+    if (e.key === 'Enter' && !e.shiftKey) {
+      const info = getMentionQueryInfo();
+      if (info) {
+        e.preventDefault();
+        const item = mentionCandidates[mentionActiveIndex];
+        if (!item) return;
+
+        if (item.type === 'all') insertAllUsersMention();
+        else insertMention(item.name, false);
+        return;
+      }
+    }
+
+    if (e.key === 'Escape') {
+      hideMentionPanel();
+      return;
+    }
+  }
+
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    document.getElementById('send-btn').click();
+  }
+};
+
+msgInput.addEventListener('input', () => {
+  if (msgInput.value.length > MAX_MESSAGE_LENGTH) {
+    msgInput.value = msgInput.value.slice(0, MAX_MESSAGE_LENGTH);
+  }
+  autoResize();
+  if (currentChat === 'public') showMentionPanel();
+  else hideMentionPanel();
+});
+
+msgInput.addEventListener('click', () => {
+  if (currentChat === 'public') showMentionPanel();
+});
+
+msgInput.addEventListener('focus', () => {
+  scheduleViewportLayout();
+  setTimeout(() => scrollBottom(), 150);
+  if (currentChat === 'public') setTimeout(showMentionPanel, 0);
+});
+
+msgInput.addEventListener('blur', () => {
+  scheduleViewportLayout();
+  setTimeout(() => {
+    if (document.activeElement !== msgInput) hideMentionPanel();
+  }, 120);
+});
+
+messagesWrap.addEventListener('scroll', updateFloatButtons, { passive: true });
+
+newMsgBelowBtn.onclick = () => {
+  newBelowCount = 0;
+  messagesWrap.scrollTop = messagesWrap.scrollHeight;
+  updateFloatButtons();
+};
+
+jumpFirstUnreadBtn.onclick = () => {
+  const target = getFirstUnreadRow(currentChat);
+  firstUnreadJumpAvailable = false;
+  if (target) messagesWrap.scrollTop = Math.max(0, target.offsetTop - 12);
+  updateFloatButtons();
+};
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (!activeChatReady || !pendingVisibleReadSeq) return;
+  const seq = pendingVisibleReadSeq;
+  pendingVisibleReadSeq = 0;
+  sendWs({ type: 'read_ack', to: currentChat === 'public' ? '' : currentChat, seq });
+});
+
+syncViewportLayout();
+
+window.addEventListener('resize', scheduleViewportLayout);
+window.addEventListener('orientationchange', () => setTimeout(scheduleViewportLayout, 300));
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', scheduleViewportLayout);
+  window.visualViewport.addEventListener('scroll', scheduleViewportLayout);
+}
+</script>
+</body>
+</html>
