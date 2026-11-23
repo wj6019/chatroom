@@ -41,9 +41,16 @@ const (
 	maxMessageChars       = 1000
 	maxUploadBytes        = 100 << 20
 	uploadDir             = "./uploads"
+	unreadWindowLimit     = 300
+	readContextLimit      = 10
 )
 
 var nickRegexp = regexp.MustCompile(`^[\p{Han}A-Za-z0-9_-]{2,15}$`)
+
+// 只允许指向本站 /upload 生成的文件地址，防止伪造 javascript: 等链接
+var fileURLRegexp = regexp.MustCompile(`^/files/[0-9]+_[0-9]{4}(\.[A-Za-z0-9]{1,16})?$`)
+var fileExtRegexp = regexp.MustCompile(`^\.[A-Za-z0-9]{1,16}$`)
+var fileMimeRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$`)
 
 type Message struct {
 	ID                string           `json:"id,omitempty"`
@@ -67,6 +74,8 @@ type Message struct {
 	FileURL           string           `json:"file_url,omitempty"`
 	FileSize          int64            `json:"file_size,omitempty"`
 	FileMime          string           `json:"file_mime,omitempty"`
+	LastReadID        int64            `json:"last_read_id,omitempty"`
+	UnreadTotal       int              `json:"unread_total,omitempty"`
 }
 
 type UserStatus struct {
@@ -82,6 +91,7 @@ type Client struct {
 	cancel           context.CancelFunc
 	mu               sync.Mutex
 	lastReadMap      map[string]int64
+	lastReadIDMap    map[string]int64
 	mentionReadMap   map[string]bool
 	dirtyLastRead    bool
 	dirtyMentionRead bool
@@ -450,12 +460,13 @@ func userExists(username string) bool {
 	return ok
 }
 
-func computeUnreadMap(lastRead map[string]int64, me string) map[string]int {
+func computeUnreadMap(c *Client) map[string]int {
 	result := make(map[string]int)
+	me := c.nick
 
-	publicLast := lastRead["public"]
+	publicLast := c.getLastReadID("public")
 	var publicCount int
-	_ = db.QueryRow("SELECT COUNT(*) FROM messages WHERE type='public' AND timestamp > ?", publicLast).Scan(&publicCount)
+	_ = db.QueryRow("SELECT COUNT(*) FROM messages WHERE type='public' AND id > ? AND sender <> ?", publicLast, me).Scan(&publicCount)
 	if publicCount > 0 {
 		result["public"] = publicCount
 	}
@@ -470,10 +481,10 @@ func computeUnreadMap(lastRead map[string]int64, me string) map[string]int {
 	hub.mu.RUnlock()
 
 	for _, peer := range users {
-		last := lastRead[peer]
+		last := c.getLastReadID(peer)
 		var count int
 		_ = db.QueryRow(
-			"SELECT COUNT(*) FROM messages WHERE type='private' AND sender=? AND receiver=? AND timestamp > ?",
+			"SELECT COUNT(*) FROM messages WHERE type='private' AND sender=? AND receiver=? AND id > ?",
 			peer, me, last,
 		).Scan(&count)
 		if count > 0 {
@@ -482,6 +493,91 @@ func computeUnreadMap(lastRead map[string]int64, me string) map[string]int {
 	}
 
 	return result
+}
+
+// chatWhere 返回某个会话（public 或与某人的私聊）的查询条件
+func chatWhere(me, chat string) (string, []any) {
+	if chat == "public" {
+		return "type='public'", nil
+	}
+	return "type='private' AND ((sender=? AND receiver=?) OR (sender=? AND receiver=?))", []any{me, chat, chat, me}
+}
+
+// getLastReadID 返回会话的已读消息编号；旧数据只有已读时间时，自动换算成编号
+func (c *Client) getLastReadID(chat string) int64 {
+	c.mu.Lock()
+	if c.lastReadIDMap == nil {
+		c.lastReadIDMap = make(map[string]int64)
+	}
+	if id, ok := c.lastReadIDMap[chat]; ok {
+		c.mu.Unlock()
+		return id
+	}
+	ts := c.lastReadMap[chat]
+	c.mu.Unlock()
+
+	var id int64
+	if ts > 0 {
+		where, args := chatWhere(c.nick, chat)
+		args = append(args, ts)
+		_ = db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM messages WHERE "+where+" AND timestamp <= ?", args...).Scan(&id)
+	}
+
+	c.mu.Lock()
+	if old, ok := c.lastReadIDMap[chat]; ok {
+		id = old
+	} else {
+		c.lastReadIDMap[chat] = id
+		c.dirtyLastRead = true
+	}
+	c.mu.Unlock()
+	return id
+}
+
+// markReadID 把会话已读位置推进到指定消息编号（只前进不后退）
+func (c *Client) markReadID(chat string, id int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastReadIDMap == nil {
+		c.lastReadIDMap = make(map[string]int64)
+	}
+	if c.lastReadMap == nil {
+		c.lastReadMap = make(map[string]int64)
+	}
+	if id > c.lastReadIDMap[chat] {
+		c.lastReadIDMap[chat] = id
+	}
+	c.lastReadMap[chat] = time.Now().Unix()
+	c.dirtyLastRead = true
+}
+
+// queryChatMessages 执行消息查询并转换为 Message 列表（保持查询顺序）
+func queryChatMessages(query string, args ...any) []Message {
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		log.Println("query messages error:", err)
+		return nil
+	}
+	defer rows.Close()
+
+	msgs := make([]Message, 0)
+	for rows.Next() {
+		var m Message
+		var mentionsRaw string
+		if err := rows.Scan(&m.DBID, &m.ID, &m.Type, &m.From, &m.To, &m.Content, &m.Timestamp, &mentionsRaw, &m.FileName, &m.FileURL, &m.FileSize, &m.FileMime); err != nil {
+			continue
+		}
+		m.Mentions = parseMentionsJSON(mentionsRaw)
+		m.Seq = m.DBID
+		msgs = append(msgs, m)
+	}
+	return msgs
+}
+
+func reverseMessages(msgs []Message) {
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
 }
 
 func loadInitialHistory(nick string) ([]Message, bool, map[string]bool, error) {
@@ -572,6 +668,7 @@ func flushClientReadState(c *Client) {
 	}
 
 	lastReadJSON := lastReadToJSON(c.lastReadMap)
+	lastReadIDJSON := lastReadToJSON(c.lastReadIDMap)
 	mentionReadJSON := mentionReadToJSON(trimMentionReadMap(c.mentionReadMap, maxMentionReadEntries))
 	dirtyLast := c.dirtyLastRead
 	dirtyMention := c.dirtyMentionRead
@@ -582,12 +679,12 @@ func flushClientReadState(c *Client) {
 
 	switch {
 	case dirtyLast && dirtyMention:
-		_, err := db.Exec("UPDATE users SET last_read_at = ?, mention_read_at = ? WHERE username = ?", lastReadJSON, mentionReadJSON, nick)
+		_, err := db.Exec("UPDATE users SET last_read_at = ?, last_read_id = ?, mention_read_at = ? WHERE username = ?", lastReadJSON, lastReadIDJSON, mentionReadJSON, nick)
 		if err != nil {
 			log.Println("flush read state error:", err)
 		}
 	case dirtyLast:
-		_, err := db.Exec("UPDATE users SET last_read_at = ? WHERE username = ?", lastReadJSON, nick)
+		_, err := db.Exec("UPDATE users SET last_read_at = ?, last_read_id = ? WHERE username = ?", lastReadJSON, lastReadIDJSON, nick)
 		if err != nil {
 			log.Println("flush last_read error:", err)
 		}
@@ -680,6 +777,9 @@ func (c *Client) handleNick(msg Message) {
 		return
 	}
 
+	var lastReadIDJSON string
+	_ = db.QueryRow("SELECT last_read_id FROM users WHERE username = ?", nick).Scan(&lastReadIDJSON)
+
 	hub.mu.Lock()
 	if existing, online := hub.nickMap[nick]; online && existing != c {
 		hub.mu.Unlock()
@@ -693,6 +793,7 @@ func (c *Client) handleNick(msg Message) {
 
 	c.mu.Lock()
 	c.lastReadMap = parseLastReadJSON(lastReadJSON)
+	c.lastReadIDMap = parseLastReadJSON(lastReadIDJSON)
 	c.mentionReadMap = parseMentionReadJSON(mentionReadJSON)
 	c.mu.Unlock()
 
@@ -706,7 +807,7 @@ func (c *Client) handleNick(msg Message) {
 		Content: mentionReadToJSON(c.mentionReadMap),
 	})
 
-	unreadMap := computeUnreadMap(c.lastReadMap, c.nick)
+	unreadMap := computeUnreadMap(c)
 	_ = safeSend(c, Message{
 		Type:      "unread_sync",
 		UnreadMap: unreadMap,
@@ -721,18 +822,68 @@ func (c *Client) loadHistoryAndSync() {
 		return
 	}
 
-	msgs, publicHasMore, privateHasMore, err := loadInitialHistory(c.nick)
-	if err != nil {
-		log.Println("load history error:", err)
-		_ = safeSend(c, Message{Type: "history_done"})
+	// 登录时不再预拉混合历史；进入会话时由 open_chat 按已读位置单独加载
+	_ = safeSend(c, Message{Type: "history_done"})
+}
+
+// handleOpenChat 进入会话：返回已读位置前 10 条 + 最多 300 条未读，并把该会话标为已读（微信方式）
+func (c *Client) handleOpenChat(msg Message) {
+	if c.nick == "" {
 		return
 	}
 
+	chat := strings.TrimSpace(msg.To)
+	if chat == "" {
+		chat = "public"
+	}
+	if chat != "public" && (chat == c.nick || !userExists(chat)) {
+		_ = safeSend(c, Message{Type: "chat_window", To: chat})
+		return
+	}
+
+	lastReadID := c.getLastReadID(chat)
+	where, baseArgs := chatWhere(c.nick, chat)
+	cols := "SELECT id, msg_id, type, sender, receiver, content, timestamp, mentions, file_name, file_url, file_size, file_mime FROM messages WHERE "
+
+	args := append(append([]any{}, baseArgs...), lastReadID, unreadWindowLimit)
+	unread := queryChatMessages(cols+where+" AND id > ? ORDER BY id DESC LIMIT ?", args...)
+	reverseMessages(unread)
+
+	var afterCount, unreadTotal int
+	args = append(append([]any{}, baseArgs...), lastReadID)
+	_ = db.QueryRow("SELECT COUNT(*) FROM messages WHERE "+where+" AND id > ?", args...).Scan(&afterCount)
+	args = append(append([]any{}, baseArgs...), lastReadID, c.nick)
+	_ = db.QueryRow("SELECT COUNT(*) FROM messages WHERE "+where+" AND id > ? AND sender <> ?", args...).Scan(&unreadTotal)
+
+	msgs := unread
+	if afterCount <= unreadWindowLimit {
+		args = append(append([]any{}, baseArgs...), lastReadID, readContextLimit)
+		read := queryChatMessages(cols+where+" AND id <= ? ORDER BY id DESC LIMIT ?", args...)
+		reverseMessages(read)
+		msgs = append(read, unread...)
+	}
+
+	hasMore := false
+	if len(msgs) > 0 {
+		var count int
+		args = append(append([]any{}, baseArgs...), msgs[0].DBID)
+		_ = db.QueryRow("SELECT COUNT(*) FROM messages WHERE "+where+" AND id < ?", args...).Scan(&count)
+		hasMore = count > 0
+	}
+
+	readTo := lastReadID
+	if len(msgs) > 0 && msgs[len(msgs)-1].DBID > readTo {
+		readTo = msgs[len(msgs)-1].DBID
+	}
+	c.markReadID(chat, readTo)
+
 	_ = safeSend(c, Message{
-		Type:              "history_done",
-		Messages:          msgs,
-		PublicHasMore:     publicHasMore,
-		PrivateHasMoreMap: privateHasMore,
+		Type:        "chat_window",
+		To:          chat,
+		Messages:    msgs,
+		HasMore:     hasMore,
+		LastReadID:  lastReadID,
+		UnreadTotal: unreadTotal,
 	})
 }
 
@@ -751,6 +902,13 @@ func (c *Client) handleReadAck(msg Message) {
 	c.lastReadMap[target] = time.Now().Unix()
 	c.dirtyLastRead = true
 	c.mu.Unlock()
+
+	readTo := msg.Seq
+	if readTo <= 0 {
+		where, args := chatWhere(c.nick, target)
+		_ = db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM messages WHERE "+where, args...).Scan(&readTo)
+	}
+	c.markReadID(target, readTo)
 }
 
 func (c *Client) handleMentionReadAck(msg Message) {
@@ -769,6 +927,50 @@ func (c *Client) handleMentionReadAck(msg Message) {
 	c.mentionReadMap = trimMentionReadMap(c.mentionReadMap, maxMentionReadEntries)
 	c.dirtyMentionRead = true
 	c.mu.Unlock()
+}
+
+// sanitizeFileFields 校验客户端提交的文件字段，只接受本站上传生成的地址
+func sanitizeFileFields(msg *Message) bool {
+	if msg.FileURL == "" {
+		return true
+	}
+	if !fileURLRegexp.MatchString(msg.FileURL) {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(uploadDir, strings.TrimPrefix(msg.FileURL, "/files/"))); err != nil {
+		return false
+	}
+	msg.FileName = sanitizeUploadName(msg.FileName)
+	if r := []rune(msg.FileName); len(r) > 255 {
+		msg.FileName = string(r[:255])
+	}
+	if msg.FileSize < 0 {
+		msg.FileSize = 0
+	}
+	if len(msg.FileMime) > 100 || !fileMimeRegexp.MatchString(msg.FileMime) {
+		msg.FileMime = "application/octet-stream"
+	}
+	return true
+}
+
+// saveMessageSync 同步写库并回填消息编号，保证广播出去的消息都带有编号
+func saveMessageSync(msg *Message) bool {
+	res, err := db.Exec(
+		"INSERT INTO messages (msg_id, type, sender, receiver, content, timestamp, mentions, file_name, file_url, file_size, file_mime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		msg.ID, msg.Type, msg.From, msg.To, msg.Content, msg.Timestamp, mentionsToJSON(msg.Mentions), msg.FileName, msg.FileURL, msg.FileSize, msg.FileMime,
+	)
+	if err != nil {
+		log.Println("DB Error:", err)
+		return false
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		log.Println("DB Error:", err)
+		return false
+	}
+	msg.DBID = id
+	msg.Seq = id
+	return true
 }
 
 func (c *Client) handlePublic(msg Message) {
@@ -790,8 +992,17 @@ func (c *Client) handlePublic(msg Message) {
 	usernames := getAllUsernamesFromMemory()
 	msg.Mentions = parseMentions(msg.Content, usernames, c.nick)
 
+	if !sanitizeFileFields(&msg) {
+		_ = safeSend(c, Message{Type: "system", Content: "文件地址无效"})
+		return
+	}
+	if !saveMessageSync(&msg) {
+		_ = safeSend(c, Message{Type: "system", Content: "消息发送失败，请稍后重试"})
+		return
+	}
+	c.markReadID("public", msg.DBID)
+
 	hub.broadcast <- msg
-	enqueueSave(msg)
 }
 
 func (c *Client) handlePrivate(msg Message) {
@@ -821,6 +1032,16 @@ func (c *Client) handlePrivate(msg Message) {
 	msg.Timestamp = time.Now().Unix()
 	msg.Content = content
 
+	if !sanitizeFileFields(&msg) {
+		_ = safeSend(c, Message{Type: "system", Content: "文件地址无效"})
+		return
+	}
+	if !saveMessageSync(&msg) {
+		_ = safeSend(c, Message{Type: "system", Content: "消息发送失败，请稍后重试"})
+		return
+	}
+	c.markReadID(targetUser, msg.DBID)
+
 	_ = safeSend(c, msg)
 
 	hub.mu.RLock()
@@ -830,8 +1051,6 @@ func (c *Client) handlePrivate(msg Message) {
 	if exists && target != c {
 		_ = safeSend(target, msg)
 	}
-
-	enqueueSave(msg)
 }
 
 func (c *Client) handleLoadMore(msg Message) {
@@ -968,6 +1187,8 @@ func (c *Client) readPump(ctx context.Context) {
 			c.handlePrivate(msg)
 		case "load_more":
 			c.handleLoadMore(msg)
+		case "open_chat":
+			c.handleOpenChat(msg)
 		}
 	}
 }
@@ -1250,6 +1471,7 @@ func setupDatabase() error {
 
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN last_read_at TEXT DEFAULT '{}'`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN mention_read_at TEXT DEFAULT '{}'`)
+	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN last_read_id TEXT DEFAULT '{}'`)
 	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN msg_id TEXT`)
 	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN mentions TEXT DEFAULT '[]'`)
 	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN file_name TEXT DEFAULT ''`)
@@ -1305,6 +1527,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	originalName := sanitizeUploadName(header.Filename)
 	ext := filepath.Ext(originalName)
+	if !fileExtRegexp.MatchString(ext) {
+		ext = ""
+	}
 	storedName := fmt.Sprintf("%d_%04d%s", time.Now().UnixMilli(), rand.Intn(10000), ext)
 	path := filepath.Join(uploadDir, storedName)
 
@@ -1332,6 +1557,22 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		"name": originalName,
 		"size": written,
 		"mime": mimeType,
+	})
+}
+
+// serveUploadedFiles 上传文件一律禁止嗅探、在沙箱中打开；非图片强制下载，防止 html/svg 在本域执行脚本
+func serveUploadedFiles(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
+		switch strings.ToLower(filepath.Ext(r.URL.Path)) {
+		case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+		default:
+			h.Set("Content-Type", "application/octet-stream")
+			h.Set("Content-Disposition", "attachment")
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -1371,7 +1612,7 @@ func main() {
 	}
 
 	http.HandleFunc("/upload", handleUpload)
-	http.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(uploadDir))))
+	http.Handle("/files/", http.StripPrefix("/files/", serveUploadedFiles(http.FileServer(http.Dir(uploadDir)))))
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := getInviteCodeFromRequest(r); !ok {
