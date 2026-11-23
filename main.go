@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/glebarez/go-sqlite"
 )
 
 //go:embed static/index.html
@@ -1030,6 +1030,7 @@ func loadAllUsersToMemory() error {
 	return nil
 }
 
+// 以 invite_codes.txt 为准同步：文件里有的=启用，文件里没有的=停用
 func importInviteCodesFromFile(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1039,28 +1040,69 @@ func importInviteCodesFromFile(path string) {
 		return
 	}
 
-	lines := strings.Split(string(data), "\n")
-	now := time.Now().Unix()
-	imported := 0
-
-	for _, line := range lines {
+	seen := map[string]bool{}
+	var codes []string
+	for _, line := range strings.Split(string(data), "\n") {
 		code := strings.TrimSpace(line)
-		if code == "" || strings.HasPrefix(code, "#") {
+		if code == "" || strings.HasPrefix(code, "#") || seen[code] {
 			continue
 		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
 
-		res, err := db.Exec("INSERT OR IGNORE INTO invite_codes(code, created_at) VALUES(?, ?)", code, now)
-		if err != nil {
+	// 防误操作：文件为空时不做任何停用，避免把所有人锁在外面
+	if len(codes) == 0 {
+		log.Println("invite_codes.txt is empty, skip sync")
+		return
+	}
+
+	now := time.Now().Unix()
+	for _, code := range codes {
+		if _, err := db.Exec(
+			"INSERT INTO invite_codes(code, created_at) VALUES(?, ?) ON CONFLICT(code) DO UPDATE SET disabled = 0",
+			code, now,
+		); err != nil {
 			log.Println("import invite code error:", err)
-			continue
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			imported++
 		}
 	}
 
-	if imported > 0 {
-		log.Printf("Imported %d invite code(s)", imported)
+	// 找出文件里已不存在、但仍启用的邀请码（先读完再更新，因为连接池只有 1 个连接）
+	rows, err := db.Query("SELECT code FROM invite_codes WHERE disabled = 0")
+	if err != nil {
+		log.Println("query invite codes error:", err)
+		return
+	}
+	var toDisable []string
+	for rows.Next() {
+		var c string
+		if rows.Scan(&c) == nil && !seen[c] {
+			toDisable = append(toDisable, c)
+		}
+	}
+	rows.Close()
+
+	for _, c := range toDisable {
+		if _, err := db.Exec("UPDATE invite_codes SET disabled = 1 WHERE code = ?", c); err != nil {
+			log.Println("disable invite code error:", err)
+		}
+	}
+	log.Printf("Invite codes synced: %d active, %d newly disabled", len(codes), len(toDisable))
+}
+
+// 每 10 秒检查文件修改时间，变了就重新同步（热加载）
+func watchInviteCodesFile(path string) {
+	var lastMod time.Time
+	if fi, err := os.Stat(path); err == nil {
+		lastMod = fi.ModTime()
+	}
+	for range time.Tick(10 * time.Second) {
+		fi, err := os.Stat(path)
+		if err != nil || fi.ModTime().Equal(lastMod) {
+			continue
+		}
+		lastMod = fi.ModTime()
+		importInviteCodesFromFile(path)
 	}
 }
 
@@ -1145,7 +1187,7 @@ func setupDatabase() error {
 
 	log.Printf("Using database: %s", dbPath)
 
-	db, err = sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=10000")
+	db, err = sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=10000")
 	if err != nil {
 		return err
 	}
@@ -1313,6 +1355,7 @@ func main() {
 	defer db.Close()
 
 	importInviteCodesFromFile("./invite_codes.txt")
+	go watchInviteCodesFile("./invite_codes.txt")
 
 	if err := loadAllUsersToMemory(); err != nil {
 		log.Println("load users warn:", err)
